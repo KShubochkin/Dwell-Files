@@ -1,0 +1,62 @@
+from pp import get_context, validate_context
+
+ctx = get_context(
+    parquet_path = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\raw_trajectories.parquet",
+    ann_csv      = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation\annotation.csv",
+    session_dir  = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation",
+    sources      = ["GA1","GA2",],
+)
+
+#validate_context(ctx)  
+
+ANN_MASTER  = "C:/Users/corna/honours/fresh1/hp_2/data_intermediate/annotation/annotation.csv"
+SESSION_DIR = "C:/Users/corna/honours/fresh1/hp_2/data_intermediate/annotation"
+BASE_OUT_DIR = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\prediction_plots"
+
+
+# TRAIN MODEL AND PLOT VALIDATION RESULTS (with RFE AND SHAP OPTIONS)
+import validation as v
+import importlib
+importlib.reload(v)
+
+from datetime import datetime
+import os
+import gc
+
+slices = {
+    "GA1": slice(None),
+    #"EA": slice(0, 586),
+    #"EA": slice(None),
+    "GA2": slice(None),
+    #"GA2": slice(0,203),
+    #"H2O": slice(None),
+}
+prefixes = list(slices.keys())
+logic_files = ['feature_calculation'] 
+
+model_folder_name = f"RUN_{'_'.join(logic_files)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+final_output_path = os.path.join(BASE_OUT_DIR, model_folder_name)
+os.makedirs(final_output_path, exist_ok=True)
+report_path = os.path.join(final_output_path, "experiment_log.txt")
+
+with open(report_path, "w") as f:
+        f.write(f"Experiment started at: {datetime.now()}\n")
+        f.write(f"Modules: {', '.join(logic_files)}\n\n")
+print(f"Outputs will be saved to: {final_output_path}")
+
+gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps = v.run_experiment(
+    ctx, 
+    slices, 
+    prefixes, 
+    logic_files, 
+    num_seeds=1,
+    n_splits=2,
+    do_rfe=False,
+)
+
+gc.collect()
+
+v.plot_results(gt, reps, scores, log_losses, auprcs, importances, rocs, raw_probs, shaps, final_output_path, report_path)
+print(f"All experiments complete. Results in {final_output_path}")
+
+del gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps
