@@ -1,3 +1,5 @@
+#mte.py
+
 import joblib
 import importlib
 import matplotlib.pyplot as plt
@@ -12,9 +14,6 @@ from scipy.ndimage import binary_opening, binary_closing, median_filter, label
 from scipy.stats import wilcoxon
 import sys
 sys.path.append(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers")
-import pipeline
-importlib.reload(pipeline)
-from pipeline import get_context
 from joblib import Parallel, delayed
 import shap
 from sklearn.feature_selection import RFECV
@@ -32,6 +31,41 @@ def post_process(probs, fps=6, threshold=0.5,
   preds = binary_opening(preds, structure=np.ones(int(min_bout_s * fps))).astype(int)
   return preds
 
+def post_process_pooled(y_true_arr, probs_arr, meta_df):
+    """Apply post_process per larva, respecting time gaps."""
+    preds = np.zeros_like(probs_arr, dtype=int)
+    meta_df = meta_df.reset_index(drop=True)
+    groups = (meta_df['source'] + "_" + meta_df['ID'].astype(str)).values
+    for g in np.unique(groups):
+        mask = groups == g
+        g_et = meta_df.loc[mask, 'et'].values
+        g_probs = probs_arr[mask]
+        # Split further on time gaps > 0.5s within the same larva
+        gap_locs = np.where(np.diff(g_et) > 0.5)[0] + 1
+        segments = np.split(np.where(mask)[0], gap_locs)
+        seg_probs = np.split(g_probs, gap_locs)
+        for seg_idx, seg_p in zip(segments, seg_probs):
+            preds[seg_idx] = post_process(seg_p)
+    return preds
+  
+def _post_process_fold(probs, test_groups, meta_df_subset):
+    """Apply post_process per larva per contiguous segment (gap-aware)."""
+    preds_flat = np.zeros(len(probs), dtype=int)
+    meta_df_subset = meta_df_subset.reset_index(drop=True)
+    groups = (meta_df_subset["source"] + "_" + meta_df_subset["ID"].astype(str)).values
+
+    for g in np.unique(groups):
+        mask = groups == g
+        g_et   = meta_df_subset.loc[mask, "et"].values
+        g_probs = probs[mask]
+        gap_locs = np.where(np.diff(g_et) > 0.5)[0] + 1
+        global_idx  = np.where(mask)[0]
+        segments    = np.split(global_idx, gap_locs)
+        seg_probs   = np.split(g_probs,    gap_locs)
+        for seg_idx, seg_p in zip(segments, seg_probs):
+            preds_flat[seg_idx] = post_process(seg_p)
+    return preds_flat
+  
 from sklearn.model_selection import RandomizedSearchCV, GroupKFold
 from sklearn.ensemble import RandomForestClassifier
 
@@ -82,7 +116,7 @@ def _shuffled_group_kfold(groups, n_splits, seed):
 
 
 def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
-              feature_names, store_raw=False, optimize_postprocess=False):
+              feature_names,meta_df, store_raw=False, optimize_postprocess=False):
     """
     Train one RF over GroupKFold (shuffled per seed).
     Post-processing pipeline: median filter sweep → threshold sweep,
@@ -120,20 +154,16 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
 
         model.fit(X_train, y_train)
         probs = model.predict_proba(X_test)[:, 1]
+        preds_flat = np.zeros_like(probs)
+        probs_flat = probs
 
-        if optimize_postprocess:
-          pass
-        else:
-          preds_flat = post_process(probs)
-          probs_flat = probs
-        
-        # for larva_idx_arr, preds_larva, probs_larva in zip(
-        #         idx_by_larva, preds_by_larva, probs_by_larva):
-        #     # Map global indices back to positions within test_idx
-        #     positions = np.searchsorted(test_idx, larva_idx_arr)
-        #     preds_flat[positions] = preds_larva
-        #     probs_flat[positions] = probs_larva
+        # Extract the groups for just this test fold so we can separate larvae
+        test_groups = groups[test_idx]
+        unique_test_groups = np.unique(test_groups)
 
+        test_meta = meta_df.iloc[test_idx].reset_index(drop=True)  # meta_df passed as new arg
+        preds_flat = _post_process_fold(probs, test_groups, test_meta)
+            
         fold_f1s[fold_num] = f1_score(y_test, preds_flat, zero_division=0)
         fold_log_losses[fold_num] = log_loss(y_test, probs, labels=[0, 1])
         fold_auprcs[fold_num] = average_precision_score(y_test, probs)
@@ -335,101 +365,6 @@ def _cm_scalars(y_true, y_pred):
     "specificity":    specificity,
     "precision":     precision,
   }
-  
-  
-def _one_seed_old(seed, seed_idx, X_values, y_values, groups, n_splits, feature_names, store_raw=False):
-  """
-  Train one RF over GroupKFold.
-
-  Returns
-  -------
-  mean_f1    : float
-  fold_preds   : dict | None  (only for seed_idx == 0)
-  importance_sum : np.ndarray  (sum over folds  averaged by caller)
-  roc_data    : list[dict]  (one dict per fold with fpr/tpr/auc)
-  raw_probs   : list[tuple]  (test_idx, probs)  for confusion matrix
-  """
-  print(f" Training seed {seed}...")
-  X_values = X_values.astype(np.float32)
-  y_values = y_values.astype(np.int32)
-  #X = pd.DataFrame(X_values)
-  #y = pd.Series(y_values)
-
-  model = RandomForestClassifier(
-    n_estimators=150,
-    max_depth=16,
-    max_features=0.3,
-    min_samples_leaf=100,
-    random_state=seed,
-    n_jobs=-1,     
-    class_weight='balanced_subsample'
-  )
-  
-  gkf = GroupKFold(n_splits=n_splits)
-  fold_f1s = np.zeros(n_splits)
-  fold_log_losses = np.zeros(n_splits)
-  fold_auprcs = np.zeros(n_splits)
-  fold_preds = {} if seed_idx == 0 else None
-  importance_sum = np.zeros(len(feature_names))
-  roc_data = []
-  raw_probs = []
-  
-  #shap_accum  = np.zeros(len(feature_names)) if (seed_idx == 0) else None
-  #shap_n_folds = 0
-  
-  for fold_num, (train_idx, test_idx) in enumerate(gkf.split(X_values, y_values, groups=groups)):
-    print(f"  Seed {seed} | Fold {fold_num + 1}/{n_splits}")
-    X_train, X_test = X_values[train_idx], X_values[test_idx]
-    y_train, y_test = y_values[train_idx], y_values[test_idx]
-    
-    model.fit(X_train, y_train)
-    probs = model.predict_proba(X_test)[:, 1]
-    
-    
-    preds = post_process(probs)
-    fold_f1s[fold_num] = f1_score(y_test, preds)
-    
-    if store_raw:
-      fpr, tpr, thresholds = roc_curve(y_test, probs)
-      roc_data.append({"fpr": fpr, "tpr": tpr, "auc": auc(fpr, tpr), "thresholds": thresholds})
-      raw_probs.append((test_idx, probs))
-
-    
-    
-    fold_log_losses[fold_num] = log_loss(y_test, probs, labels=[0, 1])
-    
-    fold_auprcs[fold_num] = average_precision_score(y_test, probs)
-    
-    if seed_idx == 0:
-      fold_preds[tuple(test_idx)] = preds
-      
-    importance_sum += model.feature_importances_
-        
-    '''
-    if seed_idx == 0:
-      explainer = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent")
-      # Use a random subsample (max 500 rows) to keep memory/time bounded
-      test_X = X.iloc[test_idx]
-      subsample = test_X.sample(min(500, len(test_X)), random_state=42)
-      shap_vals = explainer.shap_values(subsample, check_additivity=False)
-      # shap_values returns [neg_class, pos_class] for classifiers
-      sv = shap_vals[1] if isinstance(shap_vals, list) else shap_vals
-      if isinstance(shap_vals, list):
-        sv = shap_vals[1]         # old API: list[class_idx]
-      elif shap_vals.ndim == 3:
-        sv = shap_vals[:, :, 1]      # new API: slice positive class
-      else:
-        sv = shap_vals           # already (n_samples, n_features)
-      shap_accum += np.abs(sv).mean(axis=0)
-      shap_n_folds += 1
-      del explainer, shap_vals, sv, subsample'''
-
-    model.estimators_ = []
-
-  del model
-  #shap_mean_abs = (shap_accum / shap_n_folds) if (shap_n_folds > 0) else None
-  return (np.mean(fold_f1s), np.mean(fold_log_losses),np.mean(fold_auprcs),fold_preds, importance_sum / n_splits,
-      roc_data, raw_probs,) #shap_mean_abs)
 
 def run_experiment(training_data, slice_val, files_prefix, logic_modules, 
          num_seeds=5,n_splits=5,use_shap=False,do_rfe=False,optimize_postprocess=False):
@@ -474,7 +409,7 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     #   results.append(res)
     results = []
     for i in range(num_seeds):
-      res = _one_seed(42 + i, i, X_values, y_values, groups_arr, n_splits, feature_names, store_raw=(i==0),optimize_postprocess=optimize_postprocess)
+      res = _one_seed(42 + i, i, X_values, y_values, groups_arr, n_splits, feature_names,meta, store_raw=(i==0),optimize_postprocess=optimize_postprocess)
       results.append(res)
     # results = Parallel(n_jobs=-1, prefer="threads")(
     #   delayed(_one_seed)(
@@ -522,10 +457,10 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
 
     # Confusion matrix: pool all seed-0 fold probs (avoids double-counting)
     seed0_raw = results[0][6]
-    all_probs = np.empty(len(y))
+    all_probs = np.full(len(y), np.nan)
     for test_idx_tuple, probs in seed0_raw:
       all_probs[list(test_idx_tuple)] = probs
-    raw_prob_records[module_name] = (y_values, all_probs)
+    raw_prob_records[module_name] = (y_values, all_probs, meta.reset_index(drop=True))
     
     del X, y, groups, X_values, y_values, groups_arr
     gc.collect()
@@ -561,8 +496,8 @@ def _significance_report(scores_dict, log_loss_dict, auprc_dict, raw_prob_dict,l
     custom_print(f"  Mean auPRC  : {np.mean(pr_vals):.4f}  {np.std(pr_vals):.4f}")
     
     if m in raw_prob_dict:
-      y_true, probs = raw_prob_dict[m]
-      preds_pp = post_process(probs)
+      y_true, probs, meta_df = raw_prob_dict[m]
+      preds_pp = post_process_pooled(y_true, probs, meta_df)
       scalars = _cm_scalars(y_true, preds_pp)
       if scalars:
         custom_print(f"  --- Seed-0 pooled predictions ---")
@@ -641,7 +576,7 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
   plt.savefig(os.path.join(output_dir, "f1_logloss.png"), dpi=150)
   plt.close()
 
-  # 3. Feature importances                       #
+  # Feature importances                       
   for module_name, imp in importance_dict.items():
     names = np.array(imp["names"])
     mean = imp["mean"]
@@ -684,8 +619,8 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
     logs(f"SHAP feature importances for {module_name}:" + ", ".join(f"{n} ({m:.3f})" for n, m in zip(names[order][:10], mean_abs[order][:10])))
     print(f"Saved: shap_importance_{safe}.png")
 
-  # 4. ROC curves (one panel per module, all folds as thin lines +   #
-  #  mean curve interpolated)                     #
+  # 4. ROC curves (one panel per module, all folds as thin lines +
+  #  mean curve interpolated)                     
   n_mods = len(roc_dict)
   fig, axes = plt.subplots(1, n_mods, figsize=(6 * n_mods, 5), squeeze=False)
   for ax, (module_name, roc_list) in zip(axes[0], roc_dict.items()):
@@ -729,7 +664,7 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
   
   n_mods = len(raw_prob_dict)
   fig, axes = plt.subplots(1, n_mods, figsize=(5 * n_mods, 5), squeeze=False)
-  for ax, (module_name, (y_true, probs)) in zip(axes[0], raw_prob_dict.items()):
+  for ax, (module_name, (y_true, probs, meta_df)) in zip(axes[0], raw_prob_dict.items()):
     precision, recall, thresholds = precision_recall_curve(y_true, probs)
     ap = average_precision_score(y_true, probs)
 
@@ -749,7 +684,7 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
     ax.plot(recall, precision, color='darkorange', linewidth=2,
         label=f"AP = {ap:.3f}")
 
-    preds_pp = post_process(probs)
+    preds_pp = post_process_pooled(y_true, probs, meta_df)
     op_f1  = f1_score(y_true, preds_pp)
     pos_mask = (y_true == 1)
     op_prec = preds_pp[pos_mask].sum() / preds_pp.sum() if preds_pp.sum() > 0 else 0
@@ -775,8 +710,8 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
   # Confusion matrices (seed-0 pooled predictions)         #
   n_mods = len(raw_prob_dict)
   fig, axes = plt.subplots(1, n_mods, figsize=(5 * n_mods, 4), squeeze=False)
-  for ax, (module_name, (y_true, probs)) in zip(axes[0], raw_prob_dict.items()):
-    preds_pp = post_process(probs)
+  for ax, (module_name, (y_true, probs, meta_df)) in zip(axes[0], raw_prob_dict.items()):
+    preds_pp = post_process_pooled(y_true, probs, meta_df)
     cm = confusion_matrix(y_true, preds_pp)
     disp = ConfusionMatrixDisplay(cm, display_labels=["No Behav.", "Behavior"])
     disp.plot(ax=ax, colorbar=False, cmap='Blues')
@@ -799,22 +734,36 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
     fig, ax = plt.subplots(figsize=(15, 4))
 
     for i, module_name in enumerate(preds_dict.keys()):
-      df  = metas_dict[module_name]
-      mask = (df['source'] == src) & (df['ID'] == larva_id)
-      larva_meta = df[mask].sort_values('et')
-      if larva_meta.empty:
-        continue
-      if i == 0:
-        ax.plot(larva_meta['et'], larva_meta['true_behavior'],
-            label='Ground Truth', color='black',
-            alpha=0.2, linewidth=10)
-      larva_preds = preds_dict[module_name].loc[larva_meta.index]
-      ax.plot(larva_meta['et'], larva_preds,
-          label=f'Model: {module_name}',
-          color=cmap(i), linestyle='--')
+        df   = metas_dict[module_name]
+        mask = (df['source'] == src) & (df['ID'] == larva_id)
+        larva_meta = df[mask].sort_values('et').copy()
+        if larva_meta.empty:
+            continue
+
+        larva_preds = preds_dict[module_name].loc[larva_meta.index].astype(float)
+
+        # ── Build gap-broken arrays by physically inserting NaN ──────────
+        et_vals   = larva_meta['et'].values.astype(float)
+        true_vals = larva_meta['true_behavior'].values.astype(float)
+        pred_vals = larva_preds.values.astype(float)
+
+        gap_locs = np.where(np.diff(et_vals) > 0.5)[0] + 1   # indices of first frame after each gap
+        et_plot   = np.insert(et_vals,   gap_locs, np.nan)
+        true_plot = np.insert(true_vals, gap_locs, np.nan)
+        pred_plot = np.insert(pred_vals, gap_locs, np.nan)
+        # ─────────────────────────────────────────────────────────────────
+
+        if i == 0:
+            ax.plot(et_plot, true_plot,
+                    label='Ground Truth', color='black',
+                    alpha=0.2, linewidth=10, drawstyle='steps-post')
+
+        ax.plot(et_plot, pred_plot,
+                label=f'Model: {module_name}',
+                color=cmap(i), linestyle='--', drawstyle='steps-post')
 
     src_tag = src.replace("/", "_").replace("\\", "_")
-    ax.set_title(f"Comparison  Larva {larva_id} ({src_tag})")
+    ax.set_title(f"Comparison — Larva {larva_id} ({src_tag})")
     ax.legend(loc='upper right')
     fig.tight_layout()
     fig.savefig(f"{larva_path}/larva_{src_tag}_{larva_id}_comp.png", dpi=120)
