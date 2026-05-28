@@ -20,15 +20,25 @@ from sklearn.feature_selection import RFECV
 from sklearn.model_selection import GroupKFold
 import sys
 
-sys.path.append(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers")
 
 def post_process(probs, fps=6, threshold=0.5, 
         smooth_s=1.5, min_bout_s=4.5, gap_fill_s=5.5):
   """Encapsulated smoothing logic."""
   smoothed_probs = median_filter(probs, size=int(smooth_s * fps))
   preds = (smoothed_probs > threshold).astype(int)
-  preds = binary_closing(preds, structure=np.ones(int(gap_fill_s * fps))).astype(int)
-  preds = binary_opening(preds, structure=np.ones(int(min_bout_s * fps))).astype(int)
+  
+  close_size = int(gap_fill_s * fps)
+  open_size = int(min_bout_s * fps)
+  pad_len = max(close_size, open_size)
+  preds_padded = np.pad(preds, pad_width=pad_len, mode='edge')
+  
+  # 3. Apply morphological operations on the padded array
+  preds_padded = binary_closing(preds_padded, structure=np.ones(close_size)).astype(int)
+  preds_padded = binary_opening(preds_padded, structure=np.ones(open_size)).astype(int)
+  
+  # 4. Strip the padding back off to return to original length
+  preds = preds_padded[pad_len:-pad_len]
+  
   return preds
 
 def post_process_pooled(y_true_arr, probs_arr, meta_df):
@@ -730,44 +740,55 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
   os.makedirs(larva_path, exist_ok=True)
 
   for _, row in unique_larvae.iterrows():
-    src, larva_id = row['source'], row['ID']
-    fig, ax = plt.subplots(figsize=(15, 4))
+        src, larva_id = row['source'], row['ID']
+        fig, ax = plt.subplots(figsize=(15, 4))
 
-    for i, module_name in enumerate(preds_dict.keys()):
-        df   = metas_dict[module_name]
-        mask = (df['source'] == src) & (df['ID'] == larva_id)
-        larva_meta = df[mask].sort_values('et').copy()
-        if larva_meta.empty:
-            continue
+        for i, module_name in enumerate(preds_dict.keys()):
+            df = metas_dict[module_name].copy()
+            
+            # --- THE BULLETPROOF ALIGNMENT ---
+            # Attach preds and probs as columns BEFORE filtering
+            df['preds'] = preds_dict[module_name].values
+            df['probs'] = raw_prob_dict[module_name][1]
 
-        larva_preds = preds_dict[module_name].loc[larva_meta.index].astype(float)
+            # Filter for the specific larva and sort by time
+            mask = (df['source'] == src) & (df['ID'] == larva_id)
+            larva_meta = df[mask].sort_values('et').copy()
+            
+            if larva_meta.empty:
+                continue
 
-        # ── Build gap-broken arrays by physically inserting NaN ──────────
-        et_vals   = larva_meta['et'].values.astype(float)
-        true_vals = larva_meta['true_behavior'].values.astype(float)
-        pred_vals = larva_preds.values.astype(float)
+            # Because they are all in the same DataFrame, they are guaranteed to be the exact same length!
+            et_vals   = larva_meta['et'].values.astype(float)
+            true_vals = larva_meta['true_behavior'].values.astype(float)
+            pred_vals = larva_meta['preds'].values.astype(float)
+            prob_vals = larva_meta['probs'].values.astype(float)
 
-        gap_locs = np.where(np.diff(et_vals) > 0.5)[0] + 1   # indices of first frame after each gap
-        et_plot   = np.insert(et_vals,   gap_locs, np.nan)
-        true_plot = np.insert(true_vals, gap_locs, np.nan)
-        pred_plot = np.insert(pred_vals, gap_locs, np.nan)
-        # ─────────────────────────────────────────────────────────────────
+            # Insert gaps
+            gap_locs = np.where(np.diff(et_vals) > 0.5)[0] + 1
+            et_plot    = np.insert(et_vals,   gap_locs, np.nan)
+            true_plot  = np.insert(true_vals, gap_locs, np.nan)
+            pred_plot  = np.insert(pred_vals, gap_locs, np.nan)
+            probs_plot = np.insert(prob_vals, gap_locs, np.nan)
 
-        if i == 0:
-            ax.plot(et_plot, true_plot,
-                    label='Ground Truth', color='black',
-                    alpha=0.2, linewidth=10, drawstyle='steps-post')
+            if i == 0:
+                ax.plot(et_plot, true_plot,
+                        label='Ground Truth', color='black',
+                        alpha=0.2, linewidth=10, drawstyle='steps-post')
 
-        ax.plot(et_plot, pred_plot,
-                label=f'Model: {module_name}',
-                color=cmap(i), linestyle='--', drawstyle='steps-post')
+            ax.plot(et_plot, pred_plot,
+                    label=f'Model: {module_name}',
+                    color=cmap(i), linestyle='--', drawstyle='steps-post')
+            
+            ax.plot(et_plot, probs_plot, color=cmap(i), alpha=0.6, linewidth=1, label=f'Prob. {module_name}')
 
-    src_tag = src.replace("/", "_").replace("\\", "_")
-    ax.set_title(f"Comparison — Larva {larva_id} ({src_tag})")
-    ax.legend(loc='upper right')
-    fig.tight_layout()
-    fig.savefig(f"{larva_path}/larva_{src_tag}_{larva_id}_comp.png", dpi=120)
-    plt.close()
+        src_tag = src.replace("/", "_").replace("\\", "_")
+        ax.set_title(f"Comparison — Larva {larva_id} ({src_tag})")
+        ax.set_ylim(0,1)
+        ax.legend(loc='upper right')
+        fig.tight_layout()
+        fig.savefig(os.path.join(larva_path, f"larva_{src_tag}_{larva_id}_comp.png"), dpi=120)
+        plt.close()
 
   print("Saved: per-larva prediction plots")
     
