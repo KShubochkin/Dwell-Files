@@ -778,7 +778,7 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
             ax.plot(et_plot, pred_plot,
                     label=f'Model: {module_name}',
-                    color=cmap(i), linestyle='--', drawstyle='steps-post')
+                    color=cmap(i), linestyle='--', linewidth = 3, drawstyle='steps-post')
             
             ax.plot(et_plot, probs_plot, color=cmap(i), alpha=0.6, linewidth=1, label=f'Prob. {module_name}')
 
