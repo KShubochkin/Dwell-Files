@@ -485,7 +485,7 @@ def prepare_ml_dataset(
     X_final      = X[valid_mask]
     y_final      = y[valid_mask]
     groups_final = groups[valid_mask]
-    meta_final   = df.loc[valid_mask, ["source", "ID", "et"]]
+    meta_final   = df.loc[valid_mask, ["source", "ID", "et", "tags"]]
 
     # ── Representation summary ────────────────────────────────────────────────
     print("\n" + "=" * 65)
