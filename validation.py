@@ -13,6 +13,7 @@ from sklearn.metrics import classification_report, f1_score, roc_curve, auc, con
 from scipy.ndimage import binary_opening, binary_closing, median_filter, label
 from scipy.stats import wilcoxon
 import sys
+sys.path.append(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers")
 from joblib import Parallel, delayed
 import shap
 from sklearn.feature_selection import RFECV
@@ -538,11 +539,154 @@ def _significance_report(scores_dict, log_loss_dict, auprc_dict, raw_prob_dict,l
           custom_print(f"  {modules[i]} vs {modules[j]}: test failed ({e})")
   custom_print("=" * 60 + "\n")
   
+def calculate_event_metrics(y_true, y_pred, meta_df, overlap_threshold=0.3):
+    """
+    Computes event-based TP, FP, FN by aggregating overlapping predictions
+    per GT interval to avoid falsely punishing fragmented predictions as FPs.
+    """
+    from scipy.ndimage import label
+    import numpy as np
+    
+    meta_df = meta_df.reset_index(drop=True)
+    groups = (meta_df['source'] + "_" + meta_df['ID'].astype(str)).values
+    
+    tp = 0
+    fn = 0
+    fp = 0
+    
+    for g in np.unique(groups):
+        mask = groups == g
+        g_et = meta_df.loc[mask, 'et'].values
+        gap_locs = np.where(np.diff(g_et) > 0.5)[0] + 1
+        
+        y_true_seg_list = np.split(y_true[mask], gap_locs)
+        y_pred_seg_list = np.split(y_pred[mask], gap_locs)
+        
+        for yt_seg, yp_seg in zip(y_true_seg_list, y_pred_seg_list):
+            if len(yt_seg) == 0:
+                continue
+                
+            gt_labels, num_gt = label(yt_seg)
+            pred_labels, num_pred = label(yp_seg)
+            
+            # Keep track of which predicted labels are 'whitelisted' as useful
+            whitelisted_preds = set()
+            # Keep track of predicted labels that touched failed GT intervals
+            tainted_preds = set()
+            
+            # Evaluate Ground Truth Events first
+            for gt_idx in range(1, num_gt + 1):
+                gt_mask = (gt_labels == gt_idx)
+                gt_len = np.sum(gt_mask)
+                
+                # Identify all predicted events overlapping this specific GT interval
+                overlapping_preds = np.unique(pred_labels[gt_mask])
+                overlapping_preds = overlapping_preds[overlapping_preds != 0]
+                
+                # Calculate aggregated overlap frames from ALL intersecting predictions
+                total_overlap_frames = 0
+                for p_idx in overlapping_preds:
+                    pred_mask = (pred_labels == p_idx)
+                    total_overlap_frames += np.sum(gt_mask & pred_mask)
+                
+                aggregate_overlap_pct = total_overlap_frames / gt_len
+                
+                if aggregate_overlap_pct >= overlap_threshold:
+                    tp += 1
+                    # Whitelist EVERY prediction interval that contributed to this success
+                    for p_idx in overlapping_preds:
+                        whitelisted_preds.add(p_idx)
+                else:
+                    fn += 1
+                    # Mark these predictions as having touched a failed GT event
+                    for p_idx in overlapping_preds:
+                        tainted_preds.add(p_idx)
+            
+            # Evaluate Predicted Events for False Positives
+            for p_idx in range(1, num_pred + 1):
+                # An interval is a False Positive if it wasn't part of any successful TP
+                if p_idx not in whitelisted_preds:
+                    fp += 1
+
+    return tp, fp, fn
+  
+def plot_tagged_confusion_matrix(y_true, y_pred, meta_df, output_dir, module_name):
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import numpy as np
+
+    meta_df = meta_df.reset_index(drop=True)
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    tag_col = next(
+        (c for c in ['tag', 'tags', 'Tag', 'Tags'] if c in meta_df.columns), None
+    )
+    if tag_col is None:
+        print(f"Warning: No tag column found in meta_df. Skipping tagged CM for {module_name}.")
+        return
+
+    df_analysis = pd.DataFrame({
+        'GT':   y_true,
+        'Pred': y_pred,
+        'Tag':  meta_df[tag_col].fillna('None').astype(str).values
+    })
+
+    df_analysis['Tag'] = df_analysis['Tag'].str.split(';')
+    df_analysis = df_analysis.explode('Tag')
+    df_analysis['Tag'] = df_analysis['Tag'].str.strip().replace('', 'None')
+
+    counts = (
+        df_analysis
+        .groupby(['GT', 'Tag'])['Pred']
+        .value_counts()
+        .unstack(fill_value=0)
+        .reindex(columns=[0, 1], fill_value=0)
+        .rename(columns={0: 'Predicted: No Behavior (0)', 1: 'Predicted: Behavior (1)'})
+    )
+
+    # Row-normalised version (% of frames in that GT+Tag bucket)
+    pct = counts.div(counts.sum(axis=1), axis=0) * 100
+
+    row_labels = [
+        f"{'Behavior (1)' if gt == 1 else 'No Behav. (0)'} [{tag}]  (n={counts.loc[(gt,tag)].sum()})"
+        for gt, tag in counts.index
+    ]
+    counts.index = row_labels
+    pct.index    = row_labels
+
+    fig, (ax_counts, ax_pct) = plt.subplots(
+        1, 2,
+        figsize=(18, max(6, len(counts) * 0.5))
+    )
+
+    sns.heatmap(
+        counts, annot=True, fmt="d", cmap="Purples",
+        cbar=True, linewidths=0.5, ax=ax_counts
+    )
+    ax_counts.set_title(f"Frame Counts\n{module_name}")
+    ax_counts.set_ylabel("Ground Truth Condition [Tag]  (n=total frames)")
+    ax_counts.set_xlabel("Model Predictions")
+
+    sns.heatmap(
+        pct, annot=True, fmt=".1f", cmap="Greens",
+        cbar=True, linewidths=0.5, ax=ax_pct,
+        vmin=0, vmax=100
+    )
+    ax_pct.set_title(f"Row-Normalised (% of GT+Tag frames)\n{module_name}")
+    ax_pct.set_ylabel("")
+    ax_pct.set_xlabel("Model Predictions")
+
+    plt.tight_layout()
+    safe_name = module_name.replace("/", "_").replace("\\", "_")
+    plt.savefig(os.path.join(output_dir, f"tagged_cm_{safe_name}.png"), dpi=150)
+    plt.close()
+    print(f"Saved: tagged_cm_{safe_name}.png")
   
 def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict, 
         importance_dict, roc_dict, raw_prob_dict, shap_dict, output_dir,log_file):
   #plot feature importances
-  
   def logs(msg):
     if log_file:
       with open(log_file, "a", encoding="utf-8") as f:
@@ -718,18 +862,47 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
   # Confusion matrices (seed-0 pooled predictions)         #
   n_mods = len(raw_prob_dict)
-  fig, axes = plt.subplots(1, n_mods, figsize=(5 * n_mods, 4), squeeze=False)
-  for ax, (module_name, (y_true, probs, meta_df)) in zip(axes[0], raw_prob_dict.items()):
+  fig, axes = plt.subplots(2, n_mods, figsize=(5 * n_mods, 8), squeeze=False)
+  for col_idx, (module_name, (y_true, probs, meta_df)) in enumerate(raw_prob_dict.items()):
     preds_pp = post_process_pooled(y_true, probs, meta_df)
-    cm = confusion_matrix(y_true, preds_pp)
-    disp = ConfusionMatrixDisplay(cm, display_labels=["No Behav.", "Behavior"])
-    disp.plot(ax=ax, colorbar=False, cmap='Blues')
-    ax.set_title(f"Confusion Matrix\n{module_name}")
-    logs(f"Confusion Matrix for {module_name}:\n{cm} (Seed-0 pooled predictions)")
+    
+    # 1. Frame-Level CM (Row 0)
+    cm_frames = confusion_matrix(y_true, preds_pp)
+    disp_f = ConfusionMatrixDisplay(cm_frames, display_labels=["No Behav.", "Behavior"])
+    disp_f.plot(ax=axes[0, col_idx], colorbar=False, cmap='Blues')
+    axes[0, col_idx].set_title(f"Frame-Level CM\n{module_name}")
+    
+    # 2. Event-Level pseudo-CM (Row 1)
+    # Using a 0.3 (30%) overlap threshold as a reasonable baseline
+    tp_ev, fp_ev, fn_ev = calculate_event_metrics(y_true, preds_pp, meta_df, overlap_threshold=0.3)
+    
+    # Array structure mapping onto a 2x2 grid visually, setting TN to 0
+    cm_events = np.array([[0, fp_ev], 
+                          [fn_ev, tp_ev]])
+    
+    # Custom display handling the structural absence of TN
+    disp_e = ConfusionMatrixDisplay(cm_events, display_labels=["No Event", "Event"])
+    disp_e.plot(ax=axes[1, col_idx], colorbar=False, cmap='Oranges')
+    axes[1, col_idx].set_title(f"Event-Based Counts\n{module_name} (TN=0)")
+    
+    # Log the event performance metrics explicitly since CM visuals omit TN depth
+    ev_precision = tp_ev / (tp_ev + fp_ev) if (tp_ev + fp_ev) > 0 else 0
+    ev_recall = tp_ev / (tp_ev + fn_ev) if (tp_ev + fn_ev) > 0 else 0
+    ev_f1 = 2 * (ev_precision * ev_recall) / (ev_precision + ev_recall) if (ev_precision + ev_recall) > 0 else 0
+    
+    plot_tagged_confusion_matrix(y_true, preds_pp, meta_df, output_dir, module_name)
+    
+    logs(f"\nEvent-Based Metrics for {module_name}:")
+    logs(f"  TP={tp_ev}, FP={fp_ev}, FN={fn_ev}")
+    logs(f"  Event Precision: {ev_precision:.4f} | Event Recall: {ev_recall:.4f} | Event F1: {ev_f1:.4f}")
+
   plt.tight_layout()
   plt.savefig(os.path.join(output_dir, "confusion_matrices.png"), dpi=150)
   plt.close()
   print("Saved: confusion_matrices.png")
+  
+  
+  
 
   first_mod = list(metas_dict.keys())[0]
   unique_larvae = metas_dict[first_mod][['source', 'ID']].drop_duplicates()
@@ -745,8 +918,6 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
         for i, module_name in enumerate(preds_dict.keys()):
             df = metas_dict[module_name].copy()
             
-            # --- THE BULLETPROOF ALIGNMENT ---
-            # Attach preds and probs as columns BEFORE filtering
             df['preds'] = preds_dict[module_name].values
             df['probs'] = raw_prob_dict[module_name][1]
 
@@ -777,15 +948,9 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
             ax.plot(et_plot, pred_plot,
                     label=f'Model: {module_name}',
-                    color=cmap(i), linestyle='--', linewidth = 3,drawstyle='steps-post')
+                    color=cmap(i), linestyle='--',linewidth = 3, drawstyle='steps-post')
             
             ax.plot(et_plot, probs_plot, color=cmap(i), alpha=0.6, linewidth=1, label=f'Prob. {module_name}')
-
-            # add nondwelling tag labels
-            tag_df = larva_meta[(larva_meta['true_behavior'] == 0) & (larva_meta['tags'].notna())][['et', 'tags']]
-            tag_df = tag_df[tag_df['tags'] != tag_df['tags'].shift()] 
-            for _, r in tag_df.iterrows():
-                ax.text(r['et'], 0.08, str(r['tags']), fontsize=8, rotation=0, alpha=0.8, ha='left', va='bottom')
 
         src_tag = src.replace("/", "_").replace("\\", "_")
         ax.set_title(f"Comparison — Larva {larva_id} ({src_tag})")
@@ -797,7 +962,6 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
   print("Saved: per-larva prediction plots")
     
-
 # MAIN RUN BLOCK
 
 # if __name__ == "__main__":
