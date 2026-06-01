@@ -952,6 +952,12 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
             
             ax.plot(et_plot, probs_plot, color=cmap(i), alpha=0.6, linewidth=1, label=f'Prob. {module_name}')
 
+            # add nondwelling tag labels
+            tag_df = larva_meta[(larva_meta['true_behavior'] == 0) & (larva_meta['tags'].notna())][['et', 'tags']]
+            tag_df = tag_df[tag_df['tags'] != tag_df['tags'].shift()] 
+            for _, r in tag_df.iterrows():
+                ax.text(r['et'], 0.08, str(r['tags']), fontsize=8, rotation=0, alpha=0.8, ha='left', va='bottom')
+
         src_tag = src.replace("/", "_").replace("\\", "_")
         ax.set_title(f"Comparison — Larva {larva_id} ({src_tag})")
         ax.set_ylim(0,1)
