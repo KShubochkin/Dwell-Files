@@ -13,7 +13,6 @@ from sklearn.metrics import classification_report, f1_score, roc_curve, auc, con
 from scipy.ndimage import binary_opening, binary_closing, median_filter, label
 from scipy.stats import wilcoxon
 import sys
-sys.path.append(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers")
 from joblib import Parallel, delayed
 import shap
 from sklearn.feature_selection import RFECV
@@ -394,7 +393,7 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     importlib.reload(module)
     
     print("Extracting features...")
-    X, y, groups, meta = module.prepare_ml_dataset(training_data, fps=6, id_slice=slice_val, file_str=files_prefix)
+    X, y, groups, meta, log_messages = module.prepare_ml_dataset(training_data, fps=6, id_slice=slice_val, file_str=files_prefix)
     
     if do_rfe:
       selected_cols = select_features_rfe(X, y, groups, step=5)
@@ -475,7 +474,7 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     del X, y, groups, X_values, y_values, groups_arr
     gc.collect()
 
-  return representative_metas, representative_preds, all_logic_scores,all_logic_log_loss, all_logic_auprc,importance_records, roc_records, raw_prob_records, shap_records
+  return representative_metas, representative_preds, all_logic_scores,all_logic_log_loss, all_logic_auprc,importance_records, roc_records, raw_prob_records, shap_records, log_messages
 
 def _significance_report(scores_dict, log_loss_dict, auprc_dict, raw_prob_dict,log_file=None):
   """
@@ -778,7 +777,7 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
             ax.plot(et_plot, pred_plot,
                     label=f'Model: {module_name}',
-                    color=cmap(i), linestyle='--', linewidth = 3, drawstyle='steps-post')
+                    color=cmap(i), linestyle='--', linewidth = 3,drawstyle='steps-post')
             
             ax.plot(et_plot, probs_plot, color=cmap(i), alpha=0.6, linewidth=1, label=f'Prob. {module_name}')
 
@@ -798,6 +797,7 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
   print("Saved: per-larva prediction plots")
     
+
 # MAIN RUN BLOCK
 
 # if __name__ == "__main__":
