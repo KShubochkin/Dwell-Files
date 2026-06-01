@@ -54,6 +54,11 @@ gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps = v.run
     do_rfe=False,
 )
 
+with open(report_path, "a", encoding="utf-8") as f:
+    f.write("DATASET COMPOSITION\n")
+    for msg in log_messages:
+        f.write(msg + "\n")
+
 gc.collect()
 
 v.plot_results(gt, reps, scores, log_losses, auprcs, importances, rocs, raw_probs, shaps, final_output_path, report_path)
