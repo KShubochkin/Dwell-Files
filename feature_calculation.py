@@ -21,6 +21,7 @@ CONFIG = {
     "fps": 6.0,
 }
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level helpers (defined once so numba compiles them once)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,7 +82,6 @@ def has_target_tag(tag_string, target_tags):
         return False
     tags = [t.strip() for t in str(tag_string).split(";")]
     return any(t in tags for t in target_tags)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Rolling helper
@@ -252,6 +252,7 @@ def prepare_ml_dataset(
         windows = CONFIG["windows"]
     if file_str is None:
         file_str = []
+    log_messages = []
 
     df = context.annotated.copy()
     raw_counts = df.groupby("source")["behavior"].value_counts().unstack(fill_value=0)
@@ -332,7 +333,10 @@ def prepare_ml_dataset(
             idx = nd_df[nd_df["event_id"] == event].index
             selected_nd_indices.extend(idx)
             accumulated += len(idx)
-        print(f"  Tag '{tag}': collected {accumulated}/{target_frames} target frames.")
+        
+        msg = f"  Tag '{tag}': collected {accumulated}/{target_frames} target frames."
+        log_messages.append(msg)
+        print(msg)
 
     selected_nd_indices = list(set(selected_nd_indices))
     df_sampled = pd.concat([dwellers_df, nd_df.loc[selected_nd_indices]])
@@ -356,7 +360,7 @@ def prepare_ml_dataset(
             & (raw_df["et"]   <= end_et)
         ].copy().sort_values("et")
 
-        ann_safe = event_data[["et", "behavior"]].copy().sort_values("et")
+        ann_safe = event_data[["et", "behavior","tags"]].copy().sort_values("et")
         ann_safe["is_target_temp"] = True
         chunk    = chunk.astype({"et": "float32"})
         ann_safe = ann_safe.astype({"et": "float32"})
@@ -485,7 +489,7 @@ def prepare_ml_dataset(
     X_final      = X[valid_mask]
     y_final      = y[valid_mask]
     groups_final = groups[valid_mask]
-    meta_final   = df.loc[valid_mask, ["source", "ID", "et", "tags"]]
+    meta_final   = df.loc[valid_mask, ["source", "ID", "et","tags"]] # added tags
 
     # ── Representation summary ────────────────────────────────────────────────
     print("\n" + "=" * 65)
@@ -507,4 +511,4 @@ def prepare_ml_dataset(
     print("=" * 65 + "\n")
 
     gc.collect()
-    return X_final, y_final, groups_final, meta_final
+    return X_final, y_final, groups_final, meta_final, log_messages
