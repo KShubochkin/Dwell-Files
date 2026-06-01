@@ -44,7 +44,7 @@ with open(report_path, "w") as f:
         f.write(f"Modules: {', '.join(logic_files)}\n\n")
 print(f"Outputs will be saved to: {final_output_path}")
 
-gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps = v.run_experiment(
+gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps, log_messages = v.run_experiment(
     ctx, 
     slices, 
     prefixes, 
