@@ -58,8 +58,14 @@ run_name = f"{today}_{run_num:03d}"
 RUN_DIR = SPLIT_DIR / run_name
 RUN_DIR.mkdir(parents=True, exist_ok=False)
 
-TRAIN_OUT = RUN_DIR / "annotations_train.csv"
-TEST_OUT = RUN_DIR / "annotations_test.csv"
+TRAIN_DIR = RUN_DIR / "train"
+TEST_DIR= RUN_DIR / "test"
+TRAIN_DIR.mkdir(exist_ok=True)
+TEST_DIR.mkdir(exist_ok=True)
+
+TRAIN_OUT = TRAIN_DIR / "annotations_train.csv"
+TEST_OUT = TEST_DIR / "annotations_test.csv"
+
 LOG_FILE = RUN_DIR / "split_log.txt"
 
 REGISTRY_SNAPSHOT = RUN_DIR / "larva_registry_after_split.csv"
