@@ -10,17 +10,17 @@ import gc
 
 CONFIG = {
     "dwelling_tags": ["wonderful"],
-    "nondwelling_ratio_to_dwelling": 2.0,
+    "nondwelling_ratio_to_dwelling": 3.5,
     "nondwelling_tag_ratios": {
-        "crawl": 1,
-        "long": 7,
-        "arc": 1,
-        "backtrack": 1,
-        "sharp_turn": 1,
+        "crawl": 10,
+        "long": 10,
+        "arc": 10,
+        "sharp_turn": 2,
         "wide_turn": 1,
         "double_turn": 1,
+        "triple_turn": 2,
         "paused": 1,
-        "triple_turn": 1,
+        "backtrack": 1,
     },
     "windows": [11, 30, 50, 75],
     "max_window_size": 75,
@@ -28,6 +28,7 @@ CONFIG = {
     "min_coverage": 0.1,
     "fps": 6.0,
 }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level helpers (defined once so numba compiles them once)
@@ -89,7 +90,6 @@ def has_target_tag(tag_string, target_tags):
         return False
     tags = [t.strip() for t in str(tag_string).split(";")]
     return any(t in tags for t in target_tags)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Rolling helper
@@ -341,10 +341,11 @@ def prepare_ml_dataset(
             idx = nd_df[nd_df["event_id"] == event].index
             selected_nd_indices.extend(idx)
             accumulated += len(idx)
+        
         msg = f"  Tag '{tag}': collected {accumulated}/{target_frames} target frames."
         log_messages.append(msg)
         print(msg)
-        
+
     selected_nd_indices = list(set(selected_nd_indices))
     df_sampled = pd.concat([dwellers_df, nd_df.loc[selected_nd_indices]])
 
@@ -366,10 +367,9 @@ def prepare_ml_dataset(
             & (raw_df["et"]   >= start_et)
             & (raw_df["et"]   <= end_et)
         ].copy().sort_values("et")
-        
+
         ann_safe = event_data[["et", "behavior","tags"]].copy().sort_values("et")
 
-        ann_safe = event_data[["et", "behavior", "tags"]].copy().sort_values("et")
         ann_safe["is_target_temp"] = True
         chunk    = chunk.astype({"et": "float32"})
         ann_safe = ann_safe.astype({"et": "float32"})
@@ -498,8 +498,14 @@ def prepare_ml_dataset(
     X_final      = X[valid_mask]
     y_final      = y[valid_mask]
     groups_final = groups[valid_mask]
-    meta_final   = df.loc[valid_mask, ["source", "ID", "et", "tags"]]
+    meta_final   = df.loc[valid_mask, ["source", "ID", "et","tags"]]
 
+    # for filling unannotated gaps
+    plot_mask = coverage_ok
+    X_plot = X[plot_mask]
+    groups_plot = groups[plot_mask]
+    meta_plot = df.loc[plot_mask, ["source","ID","et","tags","behavior","is_target_annotation"]]
+    
     # ── Representation summary ────────────────────────────────────────────────
     print("\n" + "=" * 65)
     print(f"{'SOURCE':<15} | {'RAW POS':<8} | {'RAW NEG':<8} | {'FED POS':<8} | {'FED NEG':<8}")
@@ -520,4 +526,4 @@ def prepare_ml_dataset(
     print("=" * 65 + "\n")
 
     gc.collect()
-    return X_final, y_final, groups_final, meta_final, log_messages
+    return X_final, y_final, groups_final, meta_final, log_messages, X_plot, groups_plot, meta_plot
