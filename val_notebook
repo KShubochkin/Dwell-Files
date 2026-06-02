@@ -1,18 +1,20 @@
-from pp import get_context, validate_context
+# using training dataset
 
-ctx = get_context(
-    parquet_path = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\raw_trajectories.parquet",
-    ann_csv      = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation\annotation.csv",
-    session_dir  = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation",
-    sources      = ["GA1","GA2",],
-)
+from pp import get_context, validate_context
 
 #validate_context(ctx)  
 
-ANN_MASTER  = "C:/Users/corna/honours/fresh1/hp_2/data_intermediate/annotation/annotation.csv"
-SESSION_DIR = "C:/Users/corna/honours/fresh1/hp_2/data_intermediate/annotation"
-BASE_OUT_DIR = r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\prediction_plots"
+ANN_MASTER  = r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs\annotation.csv"
+SESSION_DIR = r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs\split_data\2026-06-02_001\train"
+BASE_OUT_DIR = r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\prediction_plots"
 
+
+ctx = get_context(
+    parquet_path = r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\raw_trajectories.parquet",
+    ann_csv      = ANN_MASTER,
+    session_dir  = SESSION_DIR,
+    sources      = ["GA1","GA2","GA3","EA"],
+)
 
 # TRAIN MODEL AND PLOT VALIDATION RESULTS (with RFE AND SHAP OPTIONS)
 import validation as v
@@ -26,9 +28,9 @@ import gc
 slices = {
     "GA1": slice(None),
     #"EA": slice(0, 586),
-    #"EA": slice(None),
+    "EA": slice(None),
     "GA2": slice(None),
-    #"GA2": slice(0,203),
+    "GA3": slice(None),
     #"H2O": slice(None),
 }
 prefixes = list(slices.keys())
@@ -44,7 +46,7 @@ with open(report_path, "w") as f:
         f.write(f"Modules: {', '.join(logic_files)}\n\n")
 print(f"Outputs will be saved to: {final_output_path}")
 
-gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps, log_messages = v.run_experiment(
+gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, full_probs, shaps, log_messages = v.run_experiment(
     ctx, 
     slices, 
     prefixes, 
@@ -61,7 +63,7 @@ with open(report_path, "a", encoding="utf-8") as f:
 
 gc.collect()
 
-v.plot_results(gt, reps, scores, log_losses, auprcs, importances, rocs, raw_probs, shaps, final_output_path, report_path)
+v.plot_results(gt, reps, scores, log_losses, auprcs, importances, rocs, raw_probs, full_probs, shaps, final_output_path, report_path)
 print(f"All experiments complete. Results in {final_output_path}")
 
 del gt, reps, scores, log_losses, auprcs,importances, rocs, raw_probs, shaps
