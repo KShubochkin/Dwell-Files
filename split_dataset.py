@@ -1,21 +1,34 @@
 """
-Generate larva-level train/test annotation splits.
+Train/Test Splitter for Dwelling Annotations
 
-This script:
-    1. Loads all annotation CSVs from all_annotations/
-    2. Preserves every annotation row exactly
-    3. Splits by larva (source + ID)
-    4. Attempts to maintain an ~80/20 train/test ratio
-       across behavioral tags
-    5. Saves annotations_train.csv and annotations_test.csv
-
-Notes
+Rules
 -----
-- Larvae are never split across train and test.
-- Multiple tags per row are supported.
-- 'consult' is ignored when balancing tags.
-- Rare tags (< MIN_TAG_COUNT occurrences) are excluded
-  from the balancing objective.
+1. Splitting is performed at the larva level.
+   - A larva is uniquely identified by (source, ID).
+   - All annotations from a larva stay together.
+
+2. The optimizer balances annotation tags.
+   - Target: ~20% of each tag in the test set.
+   - Rare tags (< MIN_TAG_COUNT) are ignored.
+
+3. A registry stores permanent assignments:
+       source, ID, split (train/test/blank)
+
+4. Once assigned:
+       train -> always train
+       test  -> always test
+
+5. New annotations inherit the larva's existing split.
+
+6. Only previously unseen larvae are optimized.
+   Existing train/test larvae remain locked.
+
+7. Each run creates:
+       annotations_train.csv
+       annotations_test.csv
+       split_log.txt
+       larva_registry_after_split.csv
+
 """
 
 import pandas as pd
@@ -26,19 +39,30 @@ import logging
 # ==========================================================
 # CONFIG
 # ==========================================================
+INPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
+OUTPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs")
 
-INPUT_DIR = Path(
-    r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs\all_annotations"
-)
+SPLIT_DIR = OUTPUT_DIR / "split_data"
+REGISTRY_FILE = OUTPUT_DIR / "larva_registry.csv"
 
-OUTPUT_DIR = Path(
-    r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs"
-)
+# --- generate folders and output files ---
+from datetime import datetime
 
-TRAIN_OUT = OUTPUT_DIR / "annotations_train.csv"
-TEST_OUT = OUTPUT_DIR / "annotations_test.csv"
+today = datetime.now().strftime("%Y-%m-%d")
 
-LOG_FILE = OUTPUT_DIR / "split_log.txt"
+existing_runs = sorted(SPLIT_DIR.glob(f"{today}_*"))
+
+run_num = len(existing_runs) + 1
+run_name = f"{today}_{run_num:03d}"
+
+RUN_DIR = SPLIT_DIR / run_name
+RUN_DIR.mkdir(parents=True, exist_ok=False)
+
+TRAIN_OUT = RUN_DIR / "annotations_train.csv"
+TEST_OUT = RUN_DIR / "annotations_test.csv"
+LOG_FILE = RUN_DIR / "split_log.txt"
+
+REGISTRY_SNAPSHOT = RUN_DIR / "larva_registry_after_split.csv"
 
 logging.basicConfig(
     level=logging.INFO,format="%(message)s", handlers=[
@@ -46,9 +70,9 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 log = logging.info
 
+# Preset constants
 TARGET_TEST_RATIO = 0.20
 MIN_TAG_COUNT = 5
 N_ITER = 5000
@@ -66,22 +90,12 @@ def split_tags(tag_string):
     --------
     'crawl;sharp_turn'
         -> ['crawl', 'sharp_turn']
-
-    'wonderful;consult'
-        -> ['wonderful']
     """
     if pd.isna(tag_string):
         return []
 
-    tags = [
-        t.strip().lower()
-        for t in str(tag_string).split(";")
-    ]
-
-    tags = [
-        t for t in tags
-        if t and t != "consult"
-    ]
+    tags = [t.strip().lower() for t in str(tag_string).split(";")]
+    tags = [t for t in tags if t and t != "consult"]
 
     return tags
 
@@ -89,6 +103,13 @@ def split_tags(tag_string):
 # ==========================================================
 # LOAD DATA
 # ==========================================================
+
+if REGISTRY_FILE.exists():
+    registry = pd.read_csv(REGISTRY_FILE)
+else:
+    registry = pd.DataFrame(
+        columns=["source","ID","split"]
+    )
 
 csv_files = list(INPUT_DIR.glob("*.csv"))
 
@@ -126,21 +147,11 @@ all_tags = sorted({
 global_tag_counts = {}
 
 for tag in all_tags:
-
-    count = sum(
-        tag in tags
-        for tags in ann["_tag_list"]
-    )
-
+    count = sum(tag in tags for tags in ann["_tag_list"])
     global_tag_counts[tag] = count
 
 # Remove rare tags from optimization
-all_tags = [
-    tag
-    for tag in all_tags
-    if global_tag_counts[tag] >= MIN_TAG_COUNT
-]
-
+all_tags = [tag for tag in all_tags if global_tag_counts[tag] >= MIN_TAG_COUNT]
 log("\nTags used for balancing:")
 
 for tag in all_tags:
@@ -156,103 +167,213 @@ larvae = (
     .reset_index(drop=True)
 )
 
-n_larvae = len(larvae)
-n_test_larvae = max(1, round(TARGET_TEST_RATIO * n_larvae))
+current_pairs = set(zip(larvae["source"], larvae["ID"]))
+known_pairs = set(zip(registry["source"], registry["ID"]))
+new_pairs = current_pairs - known_pairs
 
-log(f"\nTotal larvae: {n_larvae}")
-log(f"Target test larvae: {n_test_larvae}")
+if new_pairs:
+    new_rows = pd.DataFrame(
+        list(new_pairs),
+        columns=["source", "ID"]
+    )
+
+    new_rows["split"] = np.nan
+
+    registry = pd.concat(
+        [registry, new_rows],
+        ignore_index=True
+    )
 
 # ==========================================================
 # RANDOM SEARCH FOR BEST SPLIT
 # ==========================================================
 
-rng = np.random.default_rng(RANDOM_SEED)
+# larvae already assigned in registry
 
-best_score = np.inf
-best_test_pairs = None
-
-for _ in range(N_ITER):
-
-    selected_idx = rng.choice(
-        n_larvae,
-        size=n_test_larvae,
-        replace=False
+fixed_train_pairs = set(
+    zip(
+        registry.loc[registry["split"] == "train", "source"],
+        registry.loc[registry["split"] == "train", "ID"]
     )
+)
 
-    candidate_larvae = larvae.iloc[selected_idx]
-
-    candidate_pairs = set(
-        zip(
-            candidate_larvae["source"],
-            candidate_larvae["ID"]
-        )
+fixed_test_pairs = set(
+    zip(
+        registry.loc[registry["split"] == "test", "source"],
+        registry.loc[registry["split"] == "test", "ID"]
     )
+)
 
-    test_mask = ann.apply(
-        lambda r: (r["source"], r["ID"]) in candidate_pairs,
+# only optimize split for larvae not already assigned
+
+new_larvae = larvae[
+    ~larvae.apply(
+        lambda r:
+        (
+            (r["source"], r["ID"]) in fixed_train_pairs
+            or
+            (r["source"], r["ID"]) in fixed_test_pairs
+        ),
         axis=1
     )
+].reset_index(drop=True)
 
-    test_df = ann[test_mask]
+n_new = len(new_larvae)
 
-    score = 0.0
+log(f"\nLocked train larvae: {len(fixed_train_pairs)}")
+log(f"Locked test larvae : {len(fixed_test_pairs)}")
+log(f"New larvae         : {n_new}")
 
-    for tag in all_tags:
+# ----------------------------------------------------------
+# Optimized split - 20:80 test:train ratio among new larvae
 
-        total = global_tag_counts[tag]
+if n_new == 0:
+    log("\nNo new larvae found. Reusing existing split.")
+    best_test_pairs = fixed_test_pairs
+    best_score = 0
 
-        if total == 0:
-            continue
+else:
+    n_test_larvae = round(TARGET_TEST_RATIO * n_new)
+    n_test_larvae = min(n_test_larvae, n_new)
+    log(f"Target new test larvae: {n_test_larvae}")
 
-        test_count = sum(
-            tag in tags
-            for tags in test_df["_tag_list"]
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    best_score = np.inf
+    best_test_pairs = None
+
+    for _ in range(N_ITER):
+
+        selected_idx = rng.choice(
+            n_new,
+            size=n_test_larvae,
+            replace=False
         )
 
-        achieved_ratio = test_count / total
+        candidate_larvae = new_larvae.iloc[selected_idx]
 
-        score += (
-            achieved_ratio - TARGET_TEST_RATIO
-        ) ** 2
+        new_test_pairs = set(
+            zip(
+                candidate_larvae["source"],
+                candidate_larvae["ID"]
+            )
+        )
 
-    if score < best_score:
-        best_score = score
-        best_test_pairs = candidate_pairs
+        # old test larvae stay test forever
+        candidate_pairs = (
+            fixed_test_pairs
+            | new_test_pairs
+        )
+
+        test_mask = ann.apply(
+            lambda r:
+            (r["source"], r["ID"])
+            in candidate_pairs,
+            axis=1
+        )
+
+        test_df = ann[test_mask]
+
+        score = 0.0
+
+        for tag in all_tags:
+            total = global_tag_counts[tag]
+            if total == 0:
+                continue
+
+            test_count = sum(tag in tags for tags in test_df["_tag_list"])
+            achieved_ratio = test_count / total
+
+            score += (achieved_ratio - TARGET_TEST_RATIO) ** 2
+
+        # also balance overall event count
+        event_ratio = len(test_df) / len(ann)
+
+        score += (event_ratio - TARGET_TEST_RATIO) ** 2
+
+        if score < best_score:
+            best_score = score
+            best_test_pairs = candidate_pairs
 
 # ==========================================================
 # FINAL SPLIT
 # ==========================================================
 
 test_mask = ann.apply(
-    lambda r: (r["source"], r["ID"]) in best_test_pairs,
+    lambda r:
+    (r["source"], r["ID"])
+    in best_test_pairs,
     axis=1
 )
 
 test_df = ann[test_mask].copy()
 train_df = ann[~test_mask].copy()
 
-# Remove helper column before saving
+# ==========================================================
+# REGISTRY UPDATE & SAVING SPLIT DATASETS
+# ==========================================================
+train_pairs = set(
+    zip(
+        train_df["source"],
+        train_df["ID"]
+    )
+)
+
 train_df.drop(columns=["_tag_list"], inplace=True)
 test_df.drop(columns=["_tag_list"], inplace=True)
-
-# ==========================================================
-# SAVE
-# ==========================================================
 
 train_df.to_csv(TRAIN_OUT, index=False)
 test_df.to_csv(TEST_OUT, index=False)
 
-# ==========================================================
-# REPORT
-# ==========================================================
+test_pairs = set(
+    zip(
+        test_df["source"],
+        test_df["ID"]
+    )
+)
+
+train_pairs = set(
+    zip(
+        train_df["source"],
+        train_df["ID"]
+    )
+)
+
+registry.loc[
+    registry.apply(
+        lambda r:
+        (r["source"], r["ID"]) in test_pairs,
+        axis=1
+    ),
+    "split"
+] = "test"
+
+registry.loc[
+    registry.apply(
+        lambda r:
+        (r["source"], r["ID"]) in train_pairs,
+        axis=1
+    ),
+    "split"
+] = "train"
+
+registry.to_csv(
+    REGISTRY_FILE,
+    index=False
+)
+
+registry.to_csv(
+    REGISTRY_SNAPSHOT,
+    index=False
+)
+
+# ----------------------------------------------------------
+# REPORT LARVA COUNTS
+# ----------------------------------------------------------
 
 log("\n" + "=" * 70)
 log("SPLIT SUMMARY")
 log("=" * 70)
-
-# ----------------------------------------------------------
-# Larvae counts
-# ----------------------------------------------------------
 
 n_train_larvae = (
     train_df[["source", "ID"]]
