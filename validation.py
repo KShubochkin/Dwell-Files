@@ -13,7 +13,6 @@ from sklearn.metrics import classification_report, f1_score, roc_curve, auc, con
 from scipy.ndimage import binary_opening, binary_closing, median_filter, label
 from scipy.stats import wilcoxon
 import sys
-sys.path.append(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers")
 from joblib import Parallel, delayed
 import shap
 from sklearn.feature_selection import RFECV
@@ -126,7 +125,8 @@ def _shuffled_group_kfold(groups, n_splits, seed):
 
 
 def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
-              feature_names,meta_df, store_raw=False, optimize_postprocess=False):
+              feature_names,meta_df, X_plot, groups_plot, meta_plot,
+              store_raw=False, optimize_postprocess=False):
     """
     Train one RF over GroupKFold (shuffled per seed).
     Post-processing pipeline: median filter sweep → threshold sweep,
@@ -153,6 +153,8 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
     importance_sum = np.zeros(len(feature_names))
     roc_data = []
     raw_probs = []
+    full_plot_probs = np.full(len(meta_plot), np.nan)
+    full_plot_preds = np.full(len(meta_plot), np.nan)
 
     # Use seed-shuffled GroupKFold instead of vanilla GroupKFold
     splits = list(_shuffled_group_kfold(groups, n_splits, seed))
@@ -163,14 +165,25 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
         y_train, y_test = y_values[train_idx], y_values[test_idx]
 
         model.fit(X_train, y_train)
-        probs = model.predict_proba(X_test)[:, 1]
-        preds_flat = np.zeros_like(probs)
-        probs_flat = probs
 
         # Extract the groups for just this test fold so we can separate larvae
         test_groups = groups[test_idx]
         unique_test_groups = np.unique(test_groups)
 
+        # Predict annotated frames
+        probs = model.predict_proba(X_test)[:, 1]
+        preds_flat = np.zeros_like(probs)
+
+        # Predict and post process all frames (including unannotated)
+        plot_mask = np.isin(groups_plot, unique_test_groups)
+        if np.any(plot_mask):
+           plot_probs = model.predict_proba(X_plot[plot_mask])[:, 1]
+           full_plot_probs[plot_mask] = plot_probs
+           plot_meta_fold = meta_plot.loc[plot_mask].reset_index(drop=True)
+           plot_preds_flat = _post_process_fold(plot_probs, groups_plot[plot_mask], plot_meta_fold)
+           full_plot_preds[plot_mask] = plot_preds_flat
+
+        # Post-process annotated predictions for evaluation
         test_meta = meta_df.iloc[test_idx].reset_index(drop=True)  # meta_df passed as new arg
         preds_flat = _post_process_fold(probs, test_groups, test_meta)
             
@@ -192,6 +205,8 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
         importance_sum += model.feature_importances_
         model.estimators_ = []
 
+    print("Plot probabilities assigned:", np.sum(~np.isnan(full_plot_probs)), "/", len(full_plot_probs) )
+
     del model
     return (
         np.mean(fold_f1s),
@@ -201,6 +216,8 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
         importance_sum / n_splits,
         roc_data,
         raw_probs,
+        full_plot_probs,
+        full_plot_preds,
     )
     
 def tune_rf_hyperparameters(X, y, groups, n_splits=4, n_iter=80, metric='auprc'):
@@ -386,6 +403,7 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
   importance_records  = {}  
   roc_records      = {} 
   raw_prob_records   = {}
+  full_prob_records   = {}
   shap_records     = {}
 
   for module_name in logic_modules:
@@ -394,7 +412,7 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     importlib.reload(module)
     
     print("Extracting features...")
-    X, y, groups, meta, log_messages = module.prepare_ml_dataset(training_data, fps=6, id_slice=slice_val, file_str=files_prefix)
+    X, y, groups, meta, log_messages, X_plot, groups_plot, meta_plot = module.prepare_ml_dataset(training_data, fps=6, id_slice=slice_val, file_str=files_prefix)
     
     if do_rfe:
       selected_cols = select_features_rfe(X, y, groups, step=5)
@@ -419,7 +437,9 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     #   results.append(res)
     results = []
     for i in range(num_seeds):
-      res = _one_seed(42 + i, i, X_values, y_values, groups_arr, n_splits, feature_names,meta, store_raw=(i==0),optimize_postprocess=optimize_postprocess)
+      res = _one_seed(42 + i, i, X_values, y_values, groups_arr, n_splits, feature_names,meta,
+                      X_plot.values.astype(np.float32),np.array(groups_plot),meta_plot.reset_index(drop=True),
+                      store_raw=(i==0),optimize_postprocess=optimize_postprocess)
       results.append(res)
     # results = Parallel(n_jobs=-1, prefer="threads")(
     #   delayed(_one_seed)(
@@ -470,12 +490,14 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     all_probs = np.full(len(y), np.nan)
     for test_idx_tuple, probs in seed0_raw:
       all_probs[list(test_idx_tuple)] = probs
+
     raw_prob_records[module_name] = (y_values, all_probs, meta.reset_index(drop=True))
+    full_prob_records[module_name] = (results[0][7],results[0][8], meta_plot) # results[7]:full_plot_probs, [8]:full_plot_preds
     
     del X, y, groups, X_values, y_values, groups_arr
     gc.collect()
 
-  return representative_metas, representative_preds, all_logic_scores,all_logic_log_loss, all_logic_auprc,importance_records, roc_records, raw_prob_records, shap_records, log_messages
+  return representative_metas, representative_preds, all_logic_scores,all_logic_log_loss, all_logic_auprc,importance_records, roc_records, raw_prob_records, full_prob_records, shap_records, log_messages
 
 def _significance_report(scores_dict, log_loss_dict, auprc_dict, raw_prob_dict,log_file=None):
   """
@@ -685,7 +707,7 @@ def plot_tagged_confusion_matrix(y_true, y_pred, meta_df, output_dir, module_nam
     print(f"Saved: tagged_cm_{safe_name}.png")
   
 def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict, 
-        importance_dict, roc_dict, raw_prob_dict, shap_dict, output_dir,log_file):
+        importance_dict, roc_dict, raw_prob_dict, full_prob_dict, shap_dict, output_dir,log_file):
   #plot feature importances
   def logs(msg):
     if log_file:
@@ -901,8 +923,6 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
   plt.close()
   print("Saved: confusion_matrices.png")
   
-  
-  
 
   first_mod = list(metas_dict.keys())[0]
   unique_larvae = metas_dict[first_mod][['source', 'ID']].drop_duplicates()
@@ -916,10 +936,16 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
         fig, ax = plt.subplots(figsize=(15, 4))
 
         for i, module_name in enumerate(preds_dict.keys()):
-            df = metas_dict[module_name].copy()
-            
-            df['preds'] = preds_dict[module_name].values
-            df['probs'] = raw_prob_dict[module_name][1]
+            plot_probs, plot_preds, plot_meta = full_prob_dict[module_name]
+
+            df = plot_meta.copy()
+            df["probs"] = plot_probs
+            df["preds"] = plot_preds
+            df["true_behavior"] = np.where(
+              df["is_target_annotation"],
+              (df["behavior"] == "dwelling").astype(float),
+              np.nan
+            )
 
             # Filter for the specific larva and sort by time
             mask = (df['source'] == src) & (df['ID'] == larva_id)
