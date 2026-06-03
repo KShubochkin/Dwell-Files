@@ -1,4 +1,4 @@
-# ll41.py
+# feature_calculation.py
 
 from typing import List
 import numpy as np
@@ -10,17 +10,17 @@ import gc
 
 CONFIG = {
     "dwelling_tags": ["wonderful"],
-    "nondwelling_ratio_to_dwelling": 3.5,
+    "nondwelling_ratio_to_dwelling": 2.0,
     "nondwelling_tag_ratios": {
-        "crawl": 10,
-        "long": 10,
-        "arc": 10,
+        "crawl": 2,
+        "long": 7,
+        "arc": 2,
+        "backtrack": 2,
         "sharp_turn": 2,
-        "wide_turn": 1,
-        "double_turn": 1,
+        "wide_turn": 2,
+        "double_turn": 2,
+        "paused": 2,
         "triple_turn": 2,
-        "paused": 1,
-        "backtrack": 1,
     },
     "windows": [11, 30, 50, 75],
     "max_window_size": 75,
@@ -28,7 +28,6 @@ CONFIG = {
     "min_coverage": 0.1,
     "fps": 6.0,
 }
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level helpers (defined once so numba compiles them once)
@@ -90,6 +89,7 @@ def has_target_tag(tag_string, target_tags):
         return False
     tags = [t.strip() for t in str(tag_string).split(";")]
     return any(t in tags for t in target_tags)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Rolling helper
@@ -242,7 +242,98 @@ def _compute_window_features(
 
     return feat.astype("float32")
 
+def calculate(df,fps,pause_threshold,windows):
+    print("Calculating base metrics...")
+    g_inst = df.groupby(["source", "ID"])
 
+    df["bending"] = calc_angle_vec(
+        df["xspine_0"], df["yspine_0"],
+        df["xspine_5"], df["yspine_5"],
+        df["xspine_10"], df["yspine_10"],
+    )
+    df["bending_vel"] = g_inst["bending"].diff() * fps
+
+    df["v_head"] = np.sqrt(g_inst["xspine_0"].diff() ** 2 + g_inst["yspine_0"].diff()  ** 2) * fps
+    df["v_mid"]  = np.sqrt(g_inst["xspine_5"].diff() ** 2 + g_inst["yspine_5"].diff()  ** 2) * fps
+    df["v_tail"] = np.sqrt(g_inst["xspine_10"].diff()** 2 + g_inst["yspine_10"].diff() ** 2) * fps
+    df["v_com"]  = np.sqrt(g_inst["x"].diff() ** 2 + g_inst["y"].diff() ** 2) * fps
+
+    df["is_paused"] = (df["v_com"] < pause_threshold).astype(int)
+    df["has_neighbor"] = (df["is_paused"] == 1) & (
+        (g_inst["is_paused"].shift( 1) == 1) |
+        (g_inst["is_paused"].shift(-1) == 1)
+    )
+
+    df["angle_body"]    = np.arctan2(df["yspine_0"] - df["yspine_10"],
+                                     df["xspine_0"] - df["xspine_10"]).fillna(0)
+    df["angle_head"]    = np.arctan2(df["yspine_0"] - df["yspine_5"],
+                                     df["xspine_0"] - df["xspine_5"]).fillna(0)
+    dx_com = g_inst["x"].diff()
+    dy_com = g_inst["y"].diff()
+    df["angle_heading"] = np.arctan2(dy_com, dx_com)
+
+    def get_omega(angles: pd.Series, fps: float) -> np.ndarray:
+        clean    = np.nan_to_num(angles.to_numpy(), nan=0.0)
+        unwrapped = np.unwrap(clean)
+        return np.gradient(unwrapped) * fps
+
+    df["omega_body"]    = g_inst["angle_body"].transform(lambda x: get_omega(x, fps)).abs()
+    df["omega_head"]    = g_inst["angle_head"].transform(lambda x: get_omega(x, fps)).abs()
+    df["omega_heading"] = g_inst["angle_heading"].transform(lambda x: get_omega(x, fps)).abs()
+    df["omega_relative"]= g_inst["bending"].diff().abs() * fps
+
+    # ── NaN fill for all angular/velocity derivatives ─────────────────────────
+    # omega_relative is a diff so first frame per larva is NaN — include it here.
+    fill_cols = ["omega_body", "omega_head", "omega_heading", "omega_relative"]
+    df[fill_cols] = g_inst[fill_cols].ffill().bfill().fillna(0)
+
+    def unwrap_group(x):
+        return np.unwrap(np.nan_to_num(x.to_numpy(), nan=0.0))
+
+    df["angle_body_unwrapped"] = g_inst["angle_body"].transform(unwrap_group)
+
+    df["body_len"] = np.sqrt(
+        (df["xspine_0"] - df["xspine_10"]) ** 2
+        + (df["yspine_0"] - df["yspine_10"]) ** 2
+    )
+    group_medians = g_inst["body_len"].transform("median")
+    df["v_mid_norm"] = df["v_mid"] / (group_medians + 1e-6)
+
+    df["ht_ratio"] = (df["v_head"] + 1e-3) / (df["v_tail"] + 1e-3)
+    df["hc_ratio"] = (df["v_head"] + 1e-3) / (df["v_mid"]  + 1e-3)
+
+    df["bending_diff"] = g_inst["bending"].diff().abs() * fps
+
+    # FIX 1: use per-larva median to avoid global data leakage across CV folds
+    larva_bend_median = g_inst["bending_diff"].transform("median")
+    df["high_bend_activity"] = (df["bending_diff"] > larva_bend_median).astype(int)
+
+    df["is_peak"] = (
+        (df["bending"] > g_inst["bending"].shift( 1)) &
+        (df["bending"] > g_inst["bending"].shift(-1))
+    ).astype(int)
+
+    # ── Windowed features ─────────────────────────────────────────────────────
+    print("Calculating windowed features...")
+    X_list = []
+    for s in windows:
+        print(f"  Window {s}s ...")
+        # Recreate g_inst each iteration so it reflects any df columns added
+        # by the previous iteration (e.g. the temp revisit column if cleanup failed).
+        g_inst_w = df.groupby(["source", "ID"])
+        win_feat = _compute_window_features(df, s, fps, group_medians, g_inst_w)
+        X_list.append(win_feat)
+        del g_inst_w
+        gc.collect()
+
+    del win_feat
+    gc.collect()
+
+    print("Combining features...")
+    X = pd.concat(X_list, axis=1)
+    
+    return X.astype("float32")
+    
 # ──────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -341,11 +432,10 @@ def prepare_ml_dataset(
             idx = nd_df[nd_df["event_id"] == event].index
             selected_nd_indices.extend(idx)
             accumulated += len(idx)
-        
         msg = f"  Tag '{tag}': collected {accumulated}/{target_frames} target frames."
         log_messages.append(msg)
         print(msg)
-
+        
     selected_nd_indices = list(set(selected_nd_indices))
     df_sampled = pd.concat([dwellers_df, nd_df.loc[selected_nd_indices]])
 
@@ -367,9 +457,8 @@ def prepare_ml_dataset(
             & (raw_df["et"]   >= start_et)
             & (raw_df["et"]   <= end_et)
         ].copy().sort_values("et")
-
+        
         ann_safe = event_data[["et", "behavior","tags"]].copy().sort_values("et")
-
         ann_safe["is_target_temp"] = True
         chunk    = chunk.astype({"et": "float32"})
         ann_safe = ann_safe.astype({"et": "float32"})
@@ -390,94 +479,7 @@ def prepare_ml_dataset(
     df = df.drop_duplicates(subset=["source", "ID", "et"], keep="first").reset_index(drop=True)
 
     # ── Instantaneous base features ───────────────────────────────────────────
-    print("Calculating base metrics...")
-    g_inst = df.groupby(["source", "ID"])
-
-    df["bending"] = calc_angle_vec(
-        df["xspine_0"], df["yspine_0"],
-        df["xspine_5"], df["yspine_5"],
-        df["xspine_10"], df["yspine_10"],
-    )
-    df["bending_vel"] = g_inst["bending"].diff() * fps
-
-    df["v_head"] = np.sqrt(g_inst["xspine_0"].diff() ** 2 + g_inst["yspine_0"].diff()  ** 2) * fps
-    df["v_mid"]  = np.sqrt(g_inst["xspine_5"].diff() ** 2 + g_inst["yspine_5"].diff()  ** 2) * fps
-    df["v_tail"] = np.sqrt(g_inst["xspine_10"].diff()** 2 + g_inst["yspine_10"].diff() ** 2) * fps
-    df["v_com"]  = np.sqrt(g_inst["x"].diff() ** 2 + g_inst["y"].diff() ** 2) * fps
-
-    df["is_paused"] = (df["v_com"] < pause_threshold).astype(int)
-    df["has_neighbor"] = (df["is_paused"] == 1) & (
-        (g_inst["is_paused"].shift( 1) == 1) |
-        (g_inst["is_paused"].shift(-1) == 1)
-    )
-
-    df["angle_body"]    = np.arctan2(df["yspine_0"] - df["yspine_10"],
-                                     df["xspine_0"] - df["xspine_10"]).fillna(0)
-    df["angle_head"]    = np.arctan2(df["yspine_0"] - df["yspine_5"],
-                                     df["xspine_0"] - df["xspine_5"]).fillna(0)
-    dx_com = g_inst["x"].diff()
-    dy_com = g_inst["y"].diff()
-    df["angle_heading"] = np.arctan2(dy_com, dx_com)
-
-    def get_omega(angles: pd.Series, fps: float) -> np.ndarray:
-        clean    = np.nan_to_num(angles.to_numpy(), nan=0.0)
-        unwrapped = np.unwrap(clean)
-        return np.gradient(unwrapped) * fps
-
-    df["omega_body"]    = g_inst["angle_body"].transform(lambda x: get_omega(x, fps)).abs()
-    df["omega_head"]    = g_inst["angle_head"].transform(lambda x: get_omega(x, fps)).abs()
-    df["omega_heading"] = g_inst["angle_heading"].transform(lambda x: get_omega(x, fps)).abs()
-    df["omega_relative"]= g_inst["bending"].diff().abs() * fps
-
-    # ── NaN fill for all angular/velocity derivatives ─────────────────────────
-    # omega_relative is a diff so first frame per larva is NaN — include it here.
-    fill_cols = ["omega_body", "omega_head", "omega_heading", "omega_relative"]
-    df[fill_cols] = g_inst[fill_cols].ffill().bfill().fillna(0)
-
-    def unwrap_group(x):
-        return np.unwrap(np.nan_to_num(x.to_numpy(), nan=0.0))
-
-    df["angle_body_unwrapped"] = g_inst["angle_body"].transform(unwrap_group)
-
-    df["body_len"] = np.sqrt(
-        (df["xspine_0"] - df["xspine_10"]) ** 2
-        + (df["yspine_0"] - df["yspine_10"]) ** 2
-    )
-    group_medians = g_inst["body_len"].transform("median")
-    df["v_mid_norm"] = df["v_mid"] / (group_medians + 1e-6)
-
-    df["ht_ratio"] = (df["v_head"] + 1e-3) / (df["v_tail"] + 1e-3)
-    df["hc_ratio"] = (df["v_head"] + 1e-3) / (df["v_mid"]  + 1e-3)
-
-    df["bending_diff"] = g_inst["bending"].diff().abs() * fps
-
-    # FIX 1: use per-larva median to avoid global data leakage across CV folds
-    larva_bend_median = g_inst["bending_diff"].transform("median")
-    df["high_bend_activity"] = (df["bending_diff"] > larva_bend_median).astype(int)
-
-    df["is_peak"] = (
-        (df["bending"] > g_inst["bending"].shift( 1)) &
-        (df["bending"] > g_inst["bending"].shift(-1))
-    ).astype(int)
-
-    # ── Windowed features ─────────────────────────────────────────────────────
-    print("Calculating windowed features...")
-    X_list = []
-    for s in windows:
-        print(f"  Window {s}s ...")
-        # Recreate g_inst each iteration so it reflects any df columns added
-        # by the previous iteration (e.g. the temp revisit column if cleanup failed).
-        g_inst_w = df.groupby(["source", "ID"])
-        win_feat = _compute_window_features(df, s, fps, group_medians, g_inst_w)
-        X_list.append(win_feat)
-        del g_inst_w
-        gc.collect()
-
-    del win_feat
-    gc.collect()
-
-    print("Combining features...")
-    X = pd.concat(X_list, axis=1)
+    X = calculate(df, fps, pause_threshold, windows)
 
     y      = (df["behavior"] == "dwelling").astype(int)
     groups = df["source"] + "_" + df["ID"].astype(str)
@@ -498,7 +500,7 @@ def prepare_ml_dataset(
     X_final      = X[valid_mask]
     y_final      = y[valid_mask]
     groups_final = groups[valid_mask]
-    meta_final   = df.loc[valid_mask, ["source", "ID", "et","tags"]]
+    meta_final   = df.loc[valid_mask, ["source", "ID", "et", "tags"]]
 
     # for filling unannotated gaps
     plot_mask = coverage_ok
