@@ -85,6 +85,12 @@ for ax, (title, subset) in zip(axes, plot_sets):
     ax.set_xlabel("Duration (s)")
     ax.set_ylabel("Fraction of events")
     ax.set_ylim(0, 1)
+   
+    ax.xaxis.set_major_locator(MultipleLocator(25))
+    ax.xaxis.set_minor_locator(MultipleLocator(5))
+
+    ax.grid(which='minor', axis='x', color='lightgray', linewidth=0.5)
+    ax.grid(which='major', axis='x', color='gray', linewidth=0.8)
 
 plt.tight_layout()
 plt.show()
