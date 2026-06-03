@@ -15,8 +15,6 @@ EXCLUDE_BEHAVIORS = {"dwelling_old", "nondwelling_old"}
 
 @dataclass
 class PipelineContext:
-    """Drop-in replacement for the old PipelineContext.  ll40 only uses
-    .long_df and .annotated, so that is all we expose here."""
     long_df:   pd.DataFrame   # every raw frame from the parquet
     annotated: pd.DataFrame   # frames inside annotation intervals (+behavior, +tags)
     ann:       pd.DataFrame   # raw merged annotation table (for inspection)
@@ -24,7 +22,6 @@ class PipelineContext:
 # Annotation loading
 
 _BEHAVIOR_MAP: Dict[str, str] = {
-    # canonical forms
     "dwelling":     "dwelling",
     "dwell":        "dwelling",
     "nondwelling":  "nondwelling",
@@ -210,7 +207,7 @@ def get_context(
 ) -> PipelineContext:
     print("Loading raw trajectories from parquet...")
     long_df = load_parquet(parquet_path, sources=sources, extra_cols=extra_cols)
-    print(f"  → {len(long_df):,} frames, {long_df['ID'].nunique()} tracks, "
+    print(f"  → {len(long_df):,} frames"#, {long_df['ID'].nunique()} tracks, "
           f"sources: {sorted(long_df['source'].unique())}")
 
     print("Loading annotations...")
