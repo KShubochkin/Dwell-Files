@@ -13,6 +13,7 @@ from sklearn.metrics import classification_report, f1_score, roc_curve, auc, con
 from scipy.ndimage import binary_opening, binary_closing, median_filter, label
 from scipy.stats import wilcoxon
 import sys
+sys.path.append(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers")
 from joblib import Parallel, delayed
 import shap
 from sklearn.feature_selection import RFECV
@@ -165,15 +166,17 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
         y_train, y_test = y_values[train_idx], y_values[test_idx]
 
         model.fit(X_train, y_train)
+        probs = model.predict_proba(X_test)[:, 1]
+        preds_flat = np.zeros_like(probs)
+        probs_flat = probs
 
         # Extract the groups for just this test fold so we can separate larvae
         test_groups = groups[test_idx]
         unique_test_groups = np.unique(test_groups)
-
+        
         # Predict annotated frames
         probs = model.predict_proba(X_test)[:, 1]
         preds_flat = np.zeros_like(probs)
-
         # Predict and post process all frames (including unannotated)
         plot_mask = np.isin(groups_plot, unique_test_groups)
         if np.any(plot_mask):
@@ -182,7 +185,7 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
            plot_meta_fold = meta_plot.loc[plot_mask].reset_index(drop=True)
            plot_preds_flat = _post_process_fold(plot_probs, groups_plot[plot_mask], plot_meta_fold)
            full_plot_preds[plot_mask] = plot_preds_flat
-
+           
         # Post-process annotated predictions for evaluation
         test_meta = meta_df.iloc[test_idx].reset_index(drop=True)  # meta_df passed as new arg
         preds_flat = _post_process_fold(probs, test_groups, test_meta)
@@ -204,7 +207,7 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
 
         importance_sum += model.feature_importances_
         model.estimators_ = []
-
+    
     print("Plot probabilities assigned:", np.sum(~np.isnan(full_plot_probs)), "/", len(full_plot_probs) )
 
     del model
@@ -217,7 +220,7 @@ def _one_seed(seed, seed_idx, X_values, y_values, groups, n_splits,
         roc_data,
         raw_probs,
         full_plot_probs,
-        full_plot_preds,
+        full_plot_preds
     )
     
 def tune_rf_hyperparameters(X, y, groups, n_splits=4, n_iter=80, metric='auprc'):
@@ -403,7 +406,7 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
   importance_records  = {}  
   roc_records      = {} 
   raw_prob_records   = {}
-  full_prob_records   = {}
+  full_prob_records = {}
   shap_records     = {}
 
   for module_name in logic_modules:
@@ -490,9 +493,8 @@ def run_experiment(training_data, slice_val, files_prefix, logic_modules,
     all_probs = np.full(len(y), np.nan)
     for test_idx_tuple, probs in seed0_raw:
       all_probs[list(test_idx_tuple)] = probs
-
     raw_prob_records[module_name] = (y_values, all_probs, meta.reset_index(drop=True))
-    full_prob_records[module_name] = (results[0][7],results[0][8], meta_plot) # results[7]:full_plot_probs, [8]:full_plot_preds
+    full_prob_records[module_name] = (results[0][7],results[0][8], meta_plot)
     
     del X, y, groups, X_values, y_values, groups_arr
     gc.collect()
@@ -923,6 +925,8 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
   plt.close()
   print("Saved: confusion_matrices.png")
   
+  
+  
 
   first_mod = list(metas_dict.keys())[0]
   unique_larvae = metas_dict[first_mod][['source', 'ID']].drop_duplicates()
@@ -937,7 +941,6 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
 
         for i, module_name in enumerate(preds_dict.keys()):
             plot_probs, plot_preds, plot_meta = full_prob_dict[module_name]
-
             df = plot_meta.copy()
             df["probs"] = plot_probs
             df["preds"] = plot_preds
@@ -977,12 +980,6 @@ def plot_results(metas_dict, preds_dict, scores_dict, log_loss_dict, auprc_dict,
                     color=cmap(i), linestyle='--',linewidth = 3, drawstyle='steps-post')
             
             ax.plot(et_plot, probs_plot, color=cmap(i), alpha=0.6, linewidth=1, label=f'Prob. {module_name}')
-
-            # add nondwelling tag labels
-            tag_df = larva_meta[(larva_meta['true_behavior'] == 0) & (larva_meta['tags'].notna())][['et', 'tags']]
-            tag_df = tag_df[tag_df['tags'] != tag_df['tags'].shift()] 
-            for _, r in tag_df.iterrows():
-                ax.text(r['et'], 0.08, str(r['tags']), fontsize=8, rotation=0, alpha=0.8, ha='left', va='bottom')
 
         src_tag = src.replace("/", "_").replace("\\", "_")
         ax.set_title(f"Comparison — Larva {larva_id} ({src_tag})")
