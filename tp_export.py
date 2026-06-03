@@ -55,7 +55,7 @@ def train(ctx, slices, prefixes, logic_file,model_path,feature_path,seed,cache_p
     else:
 
         print("Extracting features from training data...")
-        X, y, groups, meta, log_messages = feature_calc.prepare_ml_dataset(ctx, fps=6, id_slice=slices, file_str=prefixes)
+        X, y, groups, meta, log_messages,*_ = feature_calc.prepare_ml_dataset(ctx, fps=6, id_slice=slices, file_str=prefixes)
 
         if not cache_dir.exists():
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +261,8 @@ def predict(probabilities_path, ppc, metadata, predictions_dir,ctx,logic_file,pl
             'prob': probs_array,
             'prediction': binary_preds
         })
+        if 'true_label' in track_data.columns:
+            track_preds_df['true_label'] = track_data['true_label'].values
         final_preds_list.append(track_preds_df)
         
     if final_preds_list:
@@ -284,51 +286,7 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
     """One figure per source — all larvae as a grid of small prob traces."""
     results = results.copy()
     
-    feature_calc = importlib.import_module(logic_file)
-    importlib.reload(feature_calc)
-
-    if hasattr(ctx, 'annotated') and not ctx.annotated.empty:
-        # 1. Clean and filter annotations
-        ann_gt = ctx.annotated[['source', 'ID', 'et', 'behavior']].copy()
-        ann_gt['tags'] = ctx.annotated['tags'] if 'tags' in ctx.annotated.columns else np.nan
-        ann_gt = ann_gt[ann_gt['behavior'].isin(['dwelling', 'nondwelling'])].copy()
-
-        target_tags = feature_calc.CONFIG['dwelling_tags']
-        ann_gt['true_label'] = (
-            (ann_gt['behavior'] == 'dwelling')
-            & ann_gt['tags'].apply(lambda tag_string: feature_calc.has_target_tag(tag_string, target_tags))
-        ).astype(int)
-
-        # Force type alignment
-        results['ID'] = results['ID'].astype(str)
-        ann_gt['ID'] = ann_gt['ID'].astype(str)
-        
-        results['et'] = results['et'].astype(np.float32)
-        ann_gt['et'] = ann_gt['et'].astype(np.float32)
-        
-        results = results.sort_values('et')
-        ann_gt = ann_gt.sort_values('et')
-
-        merged_pieces = []
-        for (s_name, gid), grp in results.groupby(['source', 'ID']):
-            ann_sub = ann_gt[(ann_gt['source'] == s_name) & (ann_gt['ID'] == gid)]
-            if ann_sub.empty:
-                grp['true_label'] = np.nan
-                merged_pieces.append(grp)
-                continue
-                
-            merged = pd.merge_asof(
-                grp, 
-                ann_sub[['et', 'true_label']], 
-                on='et', 
-                direction='nearest', 
-                tolerance=0.05 
-            )
-            merged_pieces.append(merged)
-            
-        results = pd.concat(merged_pieces, ignore_index=True)
-        print(f"  Matched {results['true_label'].notna().sum()} annotated frames.")
-    else:
+    if 'true_label' not in results.columns:
         results['true_label'] = np.nan
 
     grp_src = results[results['source'] == src]
@@ -355,10 +313,23 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
         ax.fill_between(et, pred, alpha=0.3, color='#4ade80', step='post')
         ax.plot(et, prob, color='#60a5fa', linewidth=0.6)
         if 'true_label' in grp.columns and grp['true_label'].notna().any():
-            gt = grp['true_label'].fillna(0).values
-            ax.fill_between(et, gt * -0.2, 0, alpha=0.5, color='#fb923c', step='post')
-        ax.set_ylim(-0.25, 1.05)
+            pos_mask = (grp['true_label'] == 1).astype(int)
+            ax.fill_between(et, pos_mask * -0.25, 0, alpha=0.5, color='#fb923c', step='post')
+            
+            neg_mask = (grp['true_label'] == 0).astype(int)
+            ax.fill_between(et, neg_mask * -0.1, 0, alpha=0.4, color='#9ca3af', step='post')
+        ax.set_ylim(-0.3, 1.05)
         ax.set_title(f"ID {lid}", fontsize=7, color='#aaa', pad=2)
+        
+        if len(et) > 0:
+            min_et, max_et = et[0], et[-1]
+            
+            ax.text(0.01, 0.05, f"{min_et:.1f}s", transform=ax.transAxes, 
+                    fontsize=5, color='#666666', va='bottom', ha='left')
+            
+            ax.text(0.99, 0.05, f"{max_et:.1f}s", transform=ax.transAxes, 
+                    fontsize=5, color='#666666', va='bottom', ha='right')
+            
         ax.set_facecolor('#111')
         ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
         for spine in ax.spines.values():
