@@ -8,7 +8,8 @@ from sklearn.ensemble import RandomForestClassifier
 import pandas as pd
 import psutil
 import gc
-
+import matplotlib.pyplot as plt 
+import matplotlib.patheffects as pe
 
 def _resolve_cache_dir(cache_path):
     cache_path = Path(cache_path)
@@ -27,6 +28,13 @@ def _feature_cache_file(cache_path, src, mode="train"):
 def _feature_cache_files_exist(cache_path, prefixes, mode="train"):
     return all(_feature_cache_file(cache_path, src, mode).exists() for src in prefixes)
 
+def load_model(model_path):
+    model_path = Path(model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"No model file found at {model_path}")
+    model = joblib.load(model_path)
+    print(f"Model loaded from {model_path}")
+    return model
 
 def train(ctx, slices, prefixes, logic_file,model_path,feature_path,seed,cache_path):
     
@@ -288,8 +296,6 @@ def predict(probabilities_path, ppc, metadata, predictions_dir,ctx,logic_file,pl
         print("⚠ WARNING: No matched predictions generated. Check if test IDs match inference sources.")
         return pd.DataFrame()
 
-import matplotlib.pyplot as plt 
-
 def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
     """One figure per source — all larvae as a grid of small prob traces."""
     results = results.copy()
@@ -316,11 +322,33 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
         grp = grp_src[grp_src['ID'] == lid].sort_values('et')
         et, prob, pred = grp['et'].values, grp['prob'].values, grp['prediction'].values
 
-        # A "predictiony" vibrant cyan for your models predictions
-        ax.fill_between(et, pred, alpha=0.3, color='#67e8f9', step='post') 
-        ax.plot(et, prob, color='#06b6d4', linewidth=0.6) 
+        # A "predictiony" vibrant cyan
+        ax.fill_between(et, pred, alpha=0.45, color='#00FFFF', step='post') 
+        ax.plot(et, prob, color="#BBF1FF", linewidth=0.8) 
         
-        # Semantic Masking Based on Tags & Behaviors
+        if np.any(pred):
+            diffs = np.diff(np.concatenate(([0], pred, [0])))
+            starts = np.where(diffs == 1)[0]
+            ends = np.where(diffs == -1)[0] - 1 
+            dark_outline = [pe.withStroke(linewidth=0.5, foreground='#111111')]
+            
+            for s_idx, e_idx in zip(starts, ends):
+                if s_idx < len(et) and e_idx < len(et):
+                    s_time = et[s_idx]
+                    e_time = et[e_idx]
+                    dur = e_time - s_time
+                    
+                    if dur > 0: 
+                        ax.text(s_time, 0.75, f"{s_time:.1f}", color='#cffafe', fontsize=4.5, 
+                                ha='right', va='center', path_effects=dark_outline)
+                        
+                        ax.text(e_time, 0.35, f"{e_time:.1f}", color='#cffafe', fontsize=4.5, 
+                                ha='right', va='center', path_effects=dark_outline)
+                        
+                        mid_time = s_time + (dur / 2)
+                        ax.text(mid_time, 0.05, f"{dur:.1f}s", color="#0b5864", fontsize=4.5, 
+                                ha='center', va='bottom',)
+        
         if 'behavior' in grp.columns:
             
             # 1. Wonderful Dwelling (Bright Green)
