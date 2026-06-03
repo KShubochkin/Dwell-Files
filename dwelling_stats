@@ -1,0 +1,90 @@
+# dwelling_stats.py
+
+# --------------- CELL 1 ----------------
+
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+ANNOTATION_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
+
+dfs = []
+
+for csv_file in ANNOTATION_DIR.glob("*.csv"):
+    print(f"Loading {csv_file.name}")
+    dfs.append(pd.read_csv(csv_file))
+
+if not dfs:
+    raise ValueError("No CSV files found.")
+
+df = pd.concat(dfs, ignore_index=True)
+
+df = df[df["behavior"] == "dwelling"].copy()
+df["duration_sec"] = df["t1_sec"] - df["t0_sec"]
+tags = df["tags"].fillna("").str.lower()
+
+wonderful_mask = tags.str.contains("wonderful")
+alright_mask   = tags.str.contains("alright")
+
+wonderful = df[wonderful_mask]
+alright   = df[alright_mask]
+both      = df[wonderful_mask | alright_mask]
+
+
+# --------------- CELL 2 ----------------
+
+# Summary stats
+
+plot_sets = [
+    ("Wonderful", wonderful),
+    ("Alright", alright),
+    ("Combined", both),
+]
+
+for name, subset in plot_sets:
+    if len(subset):
+        print(
+            f"{name}: "
+            f"n={len(subset)}, "
+            f"min={subset['duration_sec'].min():.1f}s, "
+            f"median={subset['duration_sec'].median():.1f}s, "
+            f"max={subset['duration_sec'].max():.1f}s"
+        )
+
+
+# --------------- CELL 3 ----------------
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, (title, subset) in zip(axes, plot_sets):
+    ax.hist(subset["duration_sec"], bins=20)
+    ax.set_title(title)
+    ax.set_xlabel("Duration (s)")
+    ax.set_ylabel("Count")
+
+plt.tight_layout()
+plt.show()
+
+
+# --------------- CELL 4 ----------------
+
+# Cumulative distrubution
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, (title, subset) in zip(axes, plot_sets):
+
+    durations = np.sort(subset["duration_sec"].values)
+
+    cdf = np.arange(1, len(durations) + 1) / len(durations)
+
+    ax.plot(durations, cdf, linewidth=2)
+
+    ax.set_title(title)
+    ax.set_xlabel("Duration (s)")
+    ax.set_ylabel("Fraction of events")
+    ax.set_ylim(0, 1)
+
+plt.tight_layout()
+plt.show()
