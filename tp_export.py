@@ -186,24 +186,29 @@ def infer(model,ctx,files,features,probabilities_path,cache_path,logic_file):
                 
         if not ann_gt.empty:
             ann_gt = ann_gt[ann_gt['behavior'].isin(['dwelling', 'nondwelling'])].copy()
-            target_tags = feature_calc.CONFIG['dwelling_tags']
-            ann_gt['true_label'] = (
-                (ann_gt['behavior'] == 'dwelling')
-                & ann_gt['tags'].apply(lambda tag_string: feature_calc.has_target_tag(tag_string, target_tags))
-            ).astype(int)
-
             res['ID'] = res['ID'].astype(str)
-            if not ann_gt.empty:
-                ann_gt['ID'] = ann_gt['ID'].astype(str)
-    
+            ann_gt['ID'] = ann_gt['ID'].astype(str)
+
             res['et'] = res['et'].astype(np.float64).round(4)
             ann_gt['et'] = ann_gt['et'].astype(np.float64).round(4)
 
-            res = res.merge(ann_gt[['source', 'ID', 'et', 'true_label']], on=['source', 'ID', 'et'], how='left')
-            print(f"  Matched {res['true_label'].notna().sum()} annotated frames.")
+            res = res.merge(ann_gt[['source', 'ID', 'et', 'behavior', 'tags']], on=['source', 'ID', 'et'], how='left')
+
+            res['true_label'] = np.nan
+            
+            # Set 1 strictly for wonderful dwelling
+            won_mask = (res['behavior'] == 'dwelling') & res['tags'].astype(str).str.contains('wonderful', na=False, case=False)
+            res.loc[won_mask, 'true_label'] = 1
+            
+            # Set 0 strictly for annotated nondwelling
+            nd_mask = (res['behavior'] == 'nondwelling')
+            res.loc[nd_mask, 'true_label'] = 0
+                        
+            print(f"  Matched {res['behavior'].notna().sum()} annotated frames.")
             
         else:
-            res['true_label'] = np.nan
+            res['behavior'] = np.nan
+            res['tags'] = np.nan
 
         #res['ID'] = pd.to_numeric(res['ID'], errors='coerce').fillna(0).astype(int).astype(str)
 
@@ -239,8 +244,9 @@ def predict(probabilities_path, ppc, metadata, predictions_dir,ctx,logic_file,pl
     final_preds_list = []
     
     unique_tracks = df_probs.index.unique()
+    sorted_tracks = sorted(unique_tracks, key=lambda x: (x[0], int(x[1]) if str(x[1]).isdigit() else x[1]))
     
-    for source, track_id in unique_tracks:
+    for source, track_id in sorted_tracks:
         track_id_str = str(track_id)
         if (source, track_id_str) not in df_probs.index:
             continue
@@ -261,8 +267,10 @@ def predict(probabilities_path, ppc, metadata, predictions_dir,ctx,logic_file,pl
             'prob': probs_array,
             'prediction': binary_preds
         })
-        if 'true_label' in track_data.columns:
-            track_preds_df['true_label'] = track_data['true_label'].values
+        if 'behavior' in track_data.columns:
+            track_preds_df['behavior'] = track_data['behavior'].values
+        if 'tags' in track_data.columns:
+            track_preds_df['tags'] = track_data['tags'].values
         final_preds_list.append(track_preds_df)
         
     if final_preds_list:
@@ -286,20 +294,18 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
     """One figure per source — all larvae as a grid of small prob traces."""
     results = results.copy()
     
-    if 'true_label' not in results.columns:
-        results['true_label'] = np.nan
-
     grp_src = results[results['source'] == src]
-    larvae = sorted(grp_src['ID'].unique())
+    
+    # FIX: Sort plots numerically so they map visually in order 1, 2, 3...
+    larvae = sorted(grp_src['ID'].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
+    
     if len(larvae) == 0:
         print(f"  No tracks found for source {src}. Skipping plot.")
         return
 
     rows = int(np.ceil(len(larvae) / cols))
-
-    fig, axes = plt.subplots(rows, cols,
-                              figsize=(cols * 4, rows * 1.8),
-                              facecolor='#111')
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 1.8), facecolor='#111')
+    
     if isinstance(axes, plt.Axes):
         axes = [axes]
     else:
@@ -310,25 +316,40 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
         grp = grp_src[grp_src['ID'] == lid].sort_values('et')
         et, prob, pred = grp['et'].values, grp['prob'].values, grp['prediction'].values
 
-        ax.fill_between(et, pred, alpha=0.3, color='#4ade80', step='post')
-        ax.plot(et, prob, color='#60a5fa', linewidth=0.6)
-        if 'true_label' in grp.columns and grp['true_label'].notna().any():
-            pos_mask = (grp['true_label'] == 1).astype(int)
-            ax.fill_between(et, pos_mask * -0.25, 0, alpha=0.5, color='#fb923c', step='post')
+        # A "predictiony" vibrant cyan for your models predictions
+        ax.fill_between(et, pred, alpha=0.3, color='#67e8f9', step='post') 
+        ax.plot(et, prob, color='#06b6d4', linewidth=0.6) 
+        
+        # Semantic Masking Based on Tags & Behaviors
+        if 'behavior' in grp.columns:
             
-            neg_mask = (grp['true_label'] == 0).astype(int)
-            ax.fill_between(et, neg_mask * -0.1, 0, alpha=0.4, color='#9ca3af', step='post')
+            # 1. Wonderful Dwelling (Bright Green)
+            won_mask = ((grp['behavior'] == 'dwelling') & grp['tags'].astype(str).str.contains('wonderful', na=False, case=False)).astype(int)
+            if won_mask.any():
+                ax.fill_between(et, won_mask * -0.25, 0, alpha=0.6, color='#22c55e', step='post')
+
+            # 2. Unsure Dwelling (Red)
+            unsure_mask = ((grp['behavior'] == 'dwelling') & grp['tags'].astype(str).str.contains('unsure', na=False, case=False)).astype(int)
+            if unsure_mask.any():
+                ax.fill_between(et, unsure_mask * -0.25, 0, alpha=0.6, color='#ef4444', step='post')
+
+            # 3. Alright Dwelling (Yellow)
+            alright_mask = ((grp['behavior'] == 'dwelling') & grp['tags'].astype(str).str.contains('alright', na=False, case=False)).astype(int)
+            if alright_mask.any():
+                ax.fill_between(et, alright_mask * -0.25, 0, alpha=0.6, color='#eab308', step='post')
+
+            # 4. Strictly Nondwelling (Grey)
+            nd_mask = (grp['behavior'] == 'nondwelling').astype(int)
+            if nd_mask.any():
+                ax.fill_between(et, nd_mask * -0.1, 0, alpha=0.4, color='#9ca3af', step='post')
+
         ax.set_ylim(-0.3, 1.05)
         ax.set_title(f"ID {lid}", fontsize=7, color='#aaa', pad=2)
         
         if len(et) > 0:
             min_et, max_et = et[0], et[-1]
-            
-            ax.text(0.01, 0.05, f"{min_et:.1f}s", transform=ax.transAxes, 
-                    fontsize=5, color='#666666', va='bottom', ha='left')
-            
-            ax.text(0.99, 0.05, f"{max_et:.1f}s", transform=ax.transAxes, 
-                    fontsize=5, color='#666666', va='bottom', ha='right')
+            ax.text(0.01, 0.05, f"{min_et:.1f}s", transform=ax.transAxes, fontsize=5, color='#666666', va='bottom', ha='left')
+            ax.text(0.99, 0.05, f"{max_et:.1f}s", transform=ax.transAxes, fontsize=5, color='#666666', va='bottom', ha='right')
             
         ax.set_facecolor('#111')
         ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
