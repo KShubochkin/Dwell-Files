@@ -36,7 +36,7 @@ def load_model(model_path):
     print(f"Model loaded from {model_path}")
     return model
 
-def train(ctx, slices, prefixes, logic_file,model_path,feature_path,seed,cache_path):
+def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_path,seed,cache_path):
     
     feature_calc = importlib.import_module(logic_file)
     importlib.reload(feature_calc)
@@ -117,10 +117,13 @@ def train(ctx, slices, prefixes, logic_file,model_path,feature_path,seed,cache_p
 
     joblib.dump(list(X.columns), feature_path)
     print(f"Feature names saved → {feature_path}")
+    
+    mod_meta.to_pickle(metadata_path)
+    print(f"Metadata saved → {metadata_path}")
 
     return model, list(X.columns), mod_meta, log_messages
 
-def infer(model,ctx,files,features,probabilities_path,cache_path,logic_file):
+def infer(model,ctx,files,features,probabilities_path,metadata_test_path,cache_path,logic_file):
     feature_calc = importlib.import_module(logic_file)
     importlib.reload(feature_calc)
     
@@ -220,7 +223,7 @@ def infer(model,ctx,files,features,probabilities_path,cache_path,logic_file):
 
         #res['ID'] = pd.to_numeric(res['ID'], errors='coerce').fillna(0).astype(int).astype(str)
 
-        # Stream to CSV
+        # to CSV
         res.to_csv(probabilities_path, mode='a', header=not probabilities_path.exists(), index=False)
         print(f"Predicted probabilities saved → {probabilities_path}")
         
@@ -231,10 +234,15 @@ def infer(model,ctx,files,features,probabilities_path,cache_path,logic_file):
         print(f"  RAM free after cleanup: {psutil.virtual_memory().available/1e9:.1f} GB")    
     
     meta_test = pd.concat(meta_test_list, ignore_index=True) if meta_test_list else None
+    
+    if meta_test is not None:
+        meta_test.to_pickle(metadata_test_path)
+        print(f"Test metadata saved → {metadata_test_path}")
+    
     return meta_test, log_messages
 
 # In tp_export.py -> predict()
-def predict(probabilities_path, ppc, metadata, predictions_dir,ctx,logic_file,plot=False): 
+def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False): 
     probabilities_path = Path(probabilities_path)
     predictions_dir = Path(predictions_dir)
     
@@ -288,7 +296,7 @@ def predict(probabilities_path, ppc, metadata, predictions_dir,ctx,logic_file,pl
         print(f"Saved complete post-processed predictions -> {output_path}")
 
         if plot:
-            for src in metadata['source'].unique():
+            for src in output_df['source'].unique():
                 plot_source_grid(output_df, src, predictions_dir, ctx, logic_file, cols=10)
 
         return output_df
@@ -317,7 +325,13 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
     else:
         axes = np.atleast_1d(axes).ravel()
 
+    print(f"  Plotting {len(larvae)} tracks for source {src} in a {rows}x{cols} grid...")
+    #progress bar
+    print()
+    num = len(larvae)
     for i, lid in enumerate(larvae):
+        print(f"\rProgress: |{i+1}/{num}|", end="")
+
         ax  = axes[i]
         grp = grp_src[grp_src['ID'] == lid].sort_values('et')
         et, prob, pred = grp['et'].values, grp['prob'].values, grp['prediction'].values
@@ -330,7 +344,7 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
             diffs = np.diff(np.concatenate(([0], pred, [0])))
             starts = np.where(diffs == 1)[0]
             ends = np.where(diffs == -1)[0] - 1 
-            dark_outline = [pe.withStroke(linewidth=0.5, foreground='#111111')]
+            dark_outline = [pe.withStroke(linewidth=1, foreground='#111111')]
             
             for s_idx, e_idx in zip(starts, ends):
                 if s_idx < len(et) and e_idx < len(et):
@@ -339,14 +353,14 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
                     dur = e_time - s_time
                     
                     if dur > 0: 
-                        ax.text(s_time, 0.75, f"{s_time:.1f}", color='#cffafe', fontsize=4.5, 
+                        ax.text(s_time, 0.75, f"{s_time:.1f}", color='#cffafe', fontsize=5, 
                                 ha='right', va='center', path_effects=dark_outline)
                         
-                        ax.text(e_time, 0.35, f"{e_time:.1f}", color='#cffafe', fontsize=4.5, 
+                        ax.text(e_time, 0.35, f"{e_time:.1f}", color='#cffafe', fontsize=5, 
                                 ha='right', va='center', path_effects=dark_outline)
                         
                         mid_time = s_time + (dur / 2)
-                        ax.text(mid_time, 0.05, f"{dur:.1f}s", color="#0b5864", fontsize=4.5, 
+                        ax.text(mid_time, 0.05, f"{dur:.1f}s", color="#082a2f", fontsize=5, 
                                 ha='center', va='bottom',)
         
         if 'behavior' in grp.columns:
@@ -384,7 +398,10 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
         for spine in ax.spines.values():
             spine.set_visible(False)
 
+    i = 0
     for ax in axes[len(larvae):]:
+        print(f"\rProgress: |{i}/{num}|", end="")
+        i += 1
         ax.set_visible(False)
 
     fig.suptitle(src, color='#ccc', fontsize=11)
