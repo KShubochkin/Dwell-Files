@@ -1,22 +1,33 @@
 #CELL 1
+import importlib
+import split_dataset as sd
+importlib.reload(sd)
+from pathlib import Path
 
+#FOR DATA SPLITTER
+TRAIN_DATA = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train")
+sd.split_dataset(TRAIN_DATA,TRAIN_DATA, mode="train")
+
+#CELL 2
 from pp import get_context, validate_context
 from dataclasses import dataclass
 from scipy.ndimage import binary_closing, binary_opening, median_filter
 import numpy as np
-from pathlib import Path
 
 
-ANN_MASTER  = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train\annotation.csv")
-SESSION_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train")
+ANN_MASTER  = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation\annotation.csv")
+SESSION_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train\train")
+VAL_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train\validation")
+
 BASE_OUT_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\exported_models")
+
 #testing files (can't select IDs)
-TEST_FILES = ["GA2"]
+TEST_FILES = ["GA1"]
 # training files and IDs
 TRAIN_SLICES = {
     #"GA1": slice(None),
-    "GA2": slice(None),
-    #"GA3": slice(None),
+    #"GA2": slice(None),
+    "GA3": slice(None),
     #"EA": slice(0, 586),
     #"EA": slice(None),
     #"H2O": slice(None),
@@ -72,9 +83,8 @@ ppc = PostProcessConfig(MF,TH,GC,GO)
 
 #validate_context(ctx)  
 
-# CELL TWO:::
+#CELL 3
 import tp_export as tp
-import importlib
 importlib.reload(tp)
 
 from datetime import datetime
@@ -85,7 +95,9 @@ import numpy as np
 
 train_str = "-".join(prefixes)
 test_str = "-".join(TEST_FILES)
-model_folder_name = f"RUN_{'_'.join(LOGIC_FILES)}_train-{train_str}_test-{test_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
+model_folder_name = f"RUN_{'_'.join(LOGIC_FILES)}_train-{train_str}_test-{test_str}_{RUN_ID}"
 
 final_output_path = BASE_OUT_DIR / model_folder_name
 model_path = final_output_path / "final_model.pkl"
@@ -93,22 +105,64 @@ probabilities_path = final_output_path / "probabilities.csv" # Changed to .csv t
 cache_dir = BASE_OUT_DIR / f"{LOGIC_FILES[0]}_cache"
 predictions_dir = final_output_path / "predictions"
 feature_path=final_output_path / "features.pkl"
+metadata_path = final_output_path / "metadata.pkl"
+metadata_test_path = final_output_path / "metadata_test.pkl"
 
 os.makedirs(predictions_dir, exist_ok=True)
 os.makedirs(final_output_path, exist_ok=True)
 report_path = os.path.join(final_output_path, "experiment_log.txt")
 
-with open(report_path, "w") as f:
-        f.write(f"Experiment started at: {datetime.now()}\n")
+with open(report_path, "a") as f:
+        f.write(f"Session initialized at: {datetime.now()}\n")
         f.write(f"Modules: {', '.join(LOGIC_FILES)}\n\n")
-print(f"Outputs will be saved to: {final_output_path}")
+print(f"Outputs are configured for: {final_output_path}")
 
-model,features,metadata,log_messages = tp.train(ctx, TRAIN_SLICES, prefixes, LOGIC_FILES[0],model_path,feature_path,SEED,cache_dir)
+
+
+#CELL 4
+model, features, metadata, log_messages = tp.train(
+    ctx, TRAIN_SLICES, prefixes, LOGIC_FILES[0], 
+    model_path, feature_path, metadata_path, SEED, cache_dir
+)
+
+# CELL 5
+import tp_export as tp
+import importlib
+import joblib
+import os
+importlib.reload(tp)
+
+model = tp.load_model(model_path)
+features = joblib.load(feature_path)
 
 if probabilities_path.exists():
     os.remove(probabilities_path)
-metadata_test,log_messages_inf = tp.infer(model,ctx,TEST_FILES,features,probabilities_path,cache_dir,LOGIC_FILES[0])
+7
+metadata_test, log_messages_inf = tp.infer(
+    model, ctx, TEST_FILES, features, probabilities_path, 
+    metadata_test_path, cache_dir, LOGIC_FILES[0]
+)
 
-#metadata is a dataframe with columns: source, ID, AN, AN_iter, start_time, end_time?
+# CELL 6
+import tp_export as tp
+import importlib
+importlib.reload(tp)
 
-predictions = tp.predict(probabilities_path,ppc,metadata_test if metadata_test is not None else metadata,predictions_dir,ctx,logic_file=LOGIC_FILES[0],plot=True)
+# predict no longer needs metadata passed to it
+predictions = tp.predict(
+    probabilities_path, ppc, predictions_dir, ctx, 
+    logic_file=LOGIC_FILES[0], plot=False
+)
+
+# CELL 7
+import tp_export as tp
+import importlib
+import pandas as pd
+importlib.reload(tp)
+
+ppc_id = ppc.get_IDstr() 
+pred_path = predictions_dir / f"{ppc_id}_predictions.csv"
+predictions = pd.read_csv(pred_path)
+
+for src in TEST_FILES:
+    tp.plot_source_grid(predictions, src, predictions_dir, ctx, LOGIC_FILES[0], cols=10)
