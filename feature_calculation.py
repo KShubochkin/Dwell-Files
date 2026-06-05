@@ -354,6 +354,7 @@ def prepare_ml_dataset(
     log_messages = []
 
     df = context.annotated.copy()
+    
     raw_counts = df.groupby("source")["behavior"].value_counts().unstack(fill_value=0)
     float_cols = df.select_dtypes(include=["float64"]).columns
     df[float_cols] = df[float_cols].astype("float32")
