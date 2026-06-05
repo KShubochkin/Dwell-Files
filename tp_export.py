@@ -10,6 +10,18 @@ import psutil
 import gc
 import matplotlib.pyplot as plt 
 import matplotlib.patheffects as pe
+import joblib
+import os
+import math
+from sklearn.metrics import (
+    mean_squared_error, roc_curve, roc_auc_score, precision_recall_curve,
+    log_loss, balanced_accuracy_score, brier_score_loss, cohen_kappa_score, 
+    confusion_matrix, f1_score, fbeta_score, matthews_corrcoef, 
+    ConfusionMatrixDisplay, DetCurveDisplay, PrecisionRecallDisplay, RocCurveDisplay, 
+    average_precision_score
+)
+from sklearn.calibration import calibration_curve, CalibrationDisplay
+from scikitplot.metrics import plot_cumulative_gain, plot_lift_curve
 
 def _resolve_cache_dir(cache_path):
     cache_path = Path(cache_path)
@@ -100,7 +112,8 @@ def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_pat
         min_samples_leaf=100,
         random_state=seed,
         n_jobs=-1,
-        class_weight='balanced_subsample'
+        class_weight='balanced_subsample',
+        oob_score=True,
     )
     
     model.fit(X_values, y_values)
@@ -123,9 +136,15 @@ def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_pat
 
     return model, list(X.columns), mod_meta, log_messages
 
-def infer(model,ctx,files,features,probabilities_path,metadata_test_path,cache_path,logic_file):
+def infer(model_path,ctx,files,feature_path,probabilities_path,metadata_test_path,cache_path,logic_file):
     feature_calc = importlib.import_module(logic_file)
     importlib.reload(feature_calc)
+    
+    model = load_model(model_path)
+    features = joblib.load(feature_path)
+
+    if probabilities_path.exists():
+        os.remove(probabilities_path)
     
     cache_path = Path(cache_path)
     cache_dir = _resolve_cache_dir(cache_path)
@@ -267,7 +286,6 @@ def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False):
         if (source, track_id_str) not in df_probs.index:
             continue
         
-        # Fixed print statement parsing 
         if int(track_id_str) % 250 == 0: 
             print(f"Predicting for {source} track {track_id_str}...")
         
@@ -304,13 +322,16 @@ def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False):
         print("⚠ WARNING: No matched predictions generated. Check if test IDs match inference sources.")
         return pd.DataFrame()
 
-def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
+def plot_source_grid(results_path, src, out_dir,ppc, cols=4):
     """One figure per source — all larvae as a grid of small prob traces."""
+    ppc_id = ppc.get_IDstr() 
+    pred_path = results_path / f"{ppc_id}_predictions.csv"
+    results = pd.read_csv(pred_path)
+
     results = results.copy()
     
     grp_src = results[results['source'] == src]
     
-    # FIX: Sort plots numerically so they map visually in order 1, 2, 3...
     larvae = sorted(grp_src['ID'].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
     
     if len(larvae) == 0:
@@ -410,3 +431,246 @@ def plot_source_grid(results, src, out_dir, ctx, logic_file, cols=4):
     fig.savefig(path, dpi=120, bbox_inches='tight', facecolor='#111')
     plt.close(fig)
     print(f"  Saved: {path}")
+
+def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, plots, 
+                       dwell_tags=["wonderful"], pred_assess=True, prob_assess=True, 
+                       rf_assess=False, descriptive=True):
+    
+    # 1. Setup & Data Ingestion
+    ppc_id = ppc.get_IDstr() 
+    preds_dir = Path(preds_dir)
+    val_dir = Path(val_dir)
+    plot_dir = Path(plots)
+    plot_dir.mkdir(parents=True, exist_ok=True) # Ensure plot directory exists
+    
+    pred_path = preds_dir / f"{ppc_id}_predictions.csv"
+    results = pd.read_csv(pred_path).copy()
+    
+    larvae = sorted(results['ID'].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
+    et, probs, preds, beh, tags = results['et'].values, results['prob'].values, results['prediction'].values, results['behavior'].values, results['tags'].values
+    
+    wonderful = ((results['behavior'] == 'dwelling') & results['tags'].astype(str).str.contains('wonderful', na=False, case=False)).astype(int)
+    alright = ((results['behavior'] == 'dwelling') & results['tags'].astype(str).str.contains('alright', na=False, case=False)).astype(int)
+    nondwelling = (results['behavior'] == 'nondwelling').astype(int)
+
+    def get_confusion_data(preds, nd, beh, tags, dtags):
+        dwell = (beh == "dwelling").astype(int)
+        tag_match = np.isin(tags, dtags)
+        dwell = np.where(tag_match, dwell, 0)
+        
+        # (nd is already the Negative Class Mask passed into the function)
+        
+        # 2. Compare directly against the independent masks!
+        tps = (dwell == 1) & (preds == 1) # True Positives
+        fns = (dwell == 1) & (preds == 0) # False Negatives
+        
+        fps = (nd == 1) & (preds == 1)    # False Positives
+        tns = (nd == 1) & (preds == 0)    # True Negatives
+        
+        return tps.sum(), tns.sum(), fps.sum(), fns.sum(), dwell.sum(), nd.sum()
+        
+    def expected_calibration_error(y_true, y_prob, n_bins=10):
+        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy='uniform')
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_assignments = np.digitize(y_prob, bin_edges) - 1
+        bin_assignments = np.clip(bin_assignments, 0, n_bins - 1)
+        
+        ece = 0.0
+        n_samples = len(y_true)
+        
+        for i in range(n_bins):
+            bin_mask = bin_assignments == i
+            bin_size = np.sum(bin_mask)
+            if bin_size > 0:
+                actual_true = np.mean(y_true[bin_mask])
+                actual_pred = np.mean(y_prob[bin_mask])
+                ece += (bin_size / n_samples) * np.abs(actual_true - actual_pred)
+                
+        return ece
+
+    def get_train_test_idx(preds_dir, ppc, train_sources, test_sources):
+        """
+        Extracts the row indices for training and testing data from the predictions CSV.
+        
+        Args:
+            preds_dir (str or Path): Directory containing the predictions CSV.
+            ppc: The post-processing classifier object (used to get the ID string).
+            train_sources (list): List of source IDs/prefixes used for training.
+            test_sources (list): List of source IDs/prefixes used for testing/inference.
+            
+        Returns:
+            train_idx (np.ndarray): Integer array of training indices.
+            test_idx (np.ndarray): Integer array of testing indices.
+        """
+        preds_dir = Path(preds_dir)
+        ppc_id = ppc.get_IDstr()
+        pred_path = preds_dir / f"{ppc_id}_predictions.csv"
+        
+        if not pred_path.exists():
+            raise FileNotFoundError(f"Predictions file not found at {pred_path}")
+            
+        df = pd.read_csv(pred_path, usecols=['source']) # Only load 'source' to save RAM
+        
+        # Extract integer indices where the source matches your splits
+        train_idx = df.index[df['source'].isin(train_sources)].to_numpy()
+        test_idx = df.index[df['source'].isin(test_sources)].to_numpy()
+        
+        # Quick sanity check
+        if len(train_idx) == 0:
+            print("⚠ WARNING: train_idx is empty. Check if train_sources match the CSV.")
+        if len(test_idx) == 0:
+            print("⚠ WARNING: test_idx is empty. Check if test_sources match the CSV.")
+            
+        return train_idx, test_idx
+
+    #train_idx, test_idx = get_train_test_idx(preds_dir,ppc,prefixes,sources)
+    dwell_mask = (beh == "dwelling") & np.isin(tags, dwell_tags)
+    nd_mask = (beh == "nondwelling")
+    
+    gt = np.zeros_like(beh, dtype=int)
+    gt[dwell_mask] = 1
+
+    eval_mask = dwell_mask | nd_mask
+    
+    gt_eval = gt[eval_mask]
+    probs_eval = probs[eval_mask]
+    preds_eval = preds[eval_mask]
+    
+    report_lines = [f"\n{'='*50}\nModel Assessment Report: {ppc_id}\n{'='*50}"]
+    
+    if pred_assess:
+        tp, tn, fp, fn, p, n = get_confusion_data(preds, nondwelling, beh, tags, dwell_tags)
+        
+        # Guard against division by zero
+        p = max(p, 1)
+        n = max(n, 1)
+        
+        tpr = tp / p      
+        tnr = tn / n      
+        fnr = fn / p      
+        fpr = fp / n
+        
+        informedness = tpr + tnr - 1
+        plr = tpr / fpr if fpr > 0 else np.nan
+        nlr = fnr / tnr if tnr > 0 else np.nan
+        
+        ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
+        npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+        fo_r = 1 - npv
+        fdr = 1 - ppv
+        acc = (tp + tn) / (p + n)
+        prev = p / (p + n)
+        ba = (tpr + tnr) / 2
+        f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+        fm = math.sqrt(ppv * tpr) # Usually calculated with precision and recall
+        
+        # Safe MCC calculation
+        mcc_denom = math.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
+        mcc = ((tp*tn) - (fp*fn)) / mcc_denom if mcc_denom > 0 else 0
+        
+        dor = plr / nlr if (nlr > 0 and not np.isnan(plr)) else np.nan
+        markedness = ppv + npv - 1
+        csi = tp / (tp + fn + fp) if (tp + fn + fp) > 0 else 0
+        
+        ck = cohen_kappa_score(gt, preds)
+        fbeta = fbeta_score(gt, preds, beta=1.0) # Fixed: added beta parameter
+        
+        # Append nicely formatted text to report
+        report_lines.extend([
+            "--- PREDICTION METRICS ---",
+            f"Accuracy:              {acc:.4f}",
+            f"Balanced Accuracy (BA):{ba:.4f}",
+            f"Sensitivity (TPR):     {tpr:.4f}",
+            f"Specificity (TNR):     {tnr:.4f}",
+            f"Precision (PPV):       {ppv:.4f}",
+            f"Negative Pred Val (NPV):{npv:.4f}",
+            f"F1 Score:              {f1:.4f}",
+            f"F-Beta Score (b=1):    {fbeta:.4f}",
+            f"Matthews Corrcoef:     {mcc:.4f}",
+            f"Cohen's Kappa:         {ck:.4f}",
+            f"Informedness:          {informedness:.4f}",
+            f"Markedness:            {markedness:.4f}",
+            f"Diagnostic Odds Ratio: {dor:.4f}",
+            f"Critical Success Index:{csi:.4f}",
+            f"Prevalence:            {prev:.4f}",
+            ""
+        ])
+
+    # 3. Probability Assessment (Continuous Metrics & Visuals)
+    if prob_assess:
+        # Use the filtered evaluation arrays!
+        pointwise_log_loss = -(gt_eval * np.log(np.clip(probs_eval, 1e-15, 1-1e-15)) + (1 - gt_eval) * np.log(1 - np.clip(probs_eval, 1e-15, 1-1e-15)))
+        
+        brier = brier_score_loss(gt_eval, probs_eval)
+        auroc = roc_auc_score(gt_eval, probs_eval)
+        ap = average_precision_score(gt_eval, probs_eval)
+        ece = expected_calibration_error(gt_eval, probs_eval)
+        
+        report_lines.extend([
+            "--- PROBABILITY METRICS ---",
+            f"AUROC:                 {auroc:.4f}",
+            f"Average Precision (AP):{ap:.4f}",
+            f"Brier Score:           {brier:.4f}",
+            f"Expected Calib Error:  {ece:.4f}",
+            ""
+        ])
+
+        plt.style.use('seaborn-v0_8-whitegrid') 
+        
+        # ROC Curve
+        fpr, tpr_curve, _ = roc_curve(gt_eval, probs_eval)
+        fig, ax = plt.subplots(figsize=(6, 6))
+        RocCurveDisplay(fpr=fpr, tpr=tpr_curve, roc_auc=auroc).plot(ax=ax)
+        ax.set_title(f"ROC Curve - {ppc_id}")
+        fig.savefig(plot_dir / f"{ppc_id}_ROC_Curve.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+        # Precision-Recall Curve
+        prec, rec, _ = precision_recall_curve(gt_eval, probs_eval)
+        fig, ax = plt.subplots(figsize=(6, 6))
+        PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap).plot(ax=ax)
+        ax.set_title(f"Precision-Recall Curve - {ppc_id}")
+        fig.savefig(plot_dir / f"{ppc_id}_PR_Curve.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+        # Calibration Curve
+        prob_true, prob_pred = calibration_curve(gt_eval, probs_eval)
+        fig, ax = plt.subplots(figsize=(6, 6))
+        CalibrationDisplay(prob_true, prob_pred, probs_eval).plot(ax=ax)
+        ax.set_title(f"Calibration Curve - {ppc_id}")
+        fig.savefig(plot_dir / f"{ppc_id}_Calibration.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+        # Confusion Matrix
+        cm = confusion_matrix(gt_eval, preds_eval)
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ConfusionMatrixDisplay(cm).plot(ax=ax, cmap='Blues')
+        ax.set_title(f"Confusion Matrix - {ppc_id}")
+        fig.savefig(plot_dir / f"{ppc_id}_Confusion_Matrix.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        
+        # DET Curve
+        fig, ax = plt.subplots(figsize=(6, 6))
+        DetCurveDisplay.from_predictions(gt_eval, probs_eval, ax=ax)
+        ax.set_title(f"DET Curve - {ppc_id}")
+        fig.savefig(plot_dir / f"{ppc_id}_DET_Curve.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+        # Cumulative Gain & Lift Curves
+        probs_2d = np.vstack([1 - probs_eval, probs_eval]).T
+        
+        fig, ax = plt.subplots(figsize=(7, 6))
+        plot_cumulative_gain(gt_eval, probs_2d, ax=ax)
+        fig.savefig(plot_dir / f"{ppc_id}_Cumulative_Gain.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        plot_lift_curve(gt_eval, probs_2d, ax=ax)
+        fig.savefig(plot_dir / f"{ppc_id}_Lift_Curve.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+    # Append to Output Text File
+    with open(report_path, 'a') as f:
+        f.write("\n".join(report_lines) + "\n")
+        
+    return True
