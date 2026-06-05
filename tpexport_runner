@@ -8,31 +8,33 @@ from pathlib import Path
 TRAIN_DATA = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train")
 sd.split_dataset(TRAIN_DATA,TRAIN_DATA, mode="train")
 
-#CELL 2
+# CELL 2
 from pp import get_context, validate_context
 from dataclasses import dataclass
 from scipy.ndimage import binary_closing, binary_opening, median_filter
 import numpy as np
-
+from pathlib import Path
+import pandas as pd
 
 ANN_MASTER  = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation\annotation.csv")
-SESSION_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train\train")
-VAL_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\train\validation")
-
+SESSION_DIR = TRAIN_DATA / "train"
+VAL_DIR     = TRAIN_DATA / "validation"
 BASE_OUT_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\exported_models")
 
-#testing files (can't select IDs)
-TEST_FILES = ["GA1"]
-# training files and IDs
-TRAIN_SLICES = {
-    #"GA1": slice(None),
-    #"GA2": slice(None),
-    "GA3": slice(None),
-    #"EA": slice(0, 586),
-    #"EA": slice(None),
-    #"H2O": slice(None),
-}
-LOGIC_FILES: list[str] = ['feature_calculation']
+train_ann = pd.read_csv(SESSION_DIR / "annotations_train.csv")
+val_ann = pd.read_csv(VAL_DIR / "annotations_validation.csv")
+
+TRAIN_PREFIXES = train_ann['source'].unique().tolist()
+TEST_FILES     = val_ann['source'].unique().tolist()
+sources        = list(set(TRAIN_PREFIXES).union(set(TEST_FILES)))
+
+# Create slices dynamically based on the train split
+TRAIN_SLICES = {src: slice(None) for src in TRAIN_PREFIXES}
+
+train_keys = train_ann[['source', 'ID']].drop_duplicates()
+val_keys = val_ann[['source', 'ID']].drop_duplicates()
+
+LOGIC_FILES = ['feature_calculation']
 SEED = 42
 
 #postprocessing parameters
@@ -42,15 +44,16 @@ GC = 5.5        # gap close (maximum gap to fill)
 GO = 4.5        # gap opening (minimum dwell length)
 
 prefixes = list(TRAIN_SLICES.keys())
-sources = list(set(prefixes).union(set(TEST_FILES)))
-
+#sources = list(set(prefixes).union(set(TEST_FILES)))
 
 ctx = get_context(
     parquet_path = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\raw_trajectories.parquet"),
     ann_csv      = ANN_MASTER,
-    session_dir  = SESSION_DIR,
-    sources=sources,
+    session_dir  = TRAIN_DATA, 
+    sources      = sources,
 )
+
+clean_full_annotations = ctx.annotated.copy()
 
 @dataclass
 class PostProcessConfig:
@@ -80,10 +83,13 @@ class PostProcessConfig:
         return f"MF{self.median_filter}_TH{self.threshold}_GC{self.gap_fill_size}_GO{self.minimum_dwell_length}"
     
 ppc = PostProcessConfig(MF,TH,GC,GO)
+ppc_id = ppc.get_IDstr() 
 
-#validate_context(ctx)  
+#validate_context(ctx)   
 
 #CELL 3
+
+import importlib
 import tp_export as tp
 importlib.reload(tp)
 
@@ -92,77 +98,81 @@ import os
 import gc
 
 import numpy as np
+import shutil
 
 train_str = "-".join(prefixes)
-test_str = "-".join(TEST_FILES)
+test_str = "-".join(prefixes)
 
-RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
+RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S') #"20260604_145321" #
 model_folder_name = f"RUN_{'_'.join(LOGIC_FILES)}_train-{train_str}_test-{test_str}_{RUN_ID}"
 
 final_output_path = BASE_OUT_DIR / model_folder_name
+
 model_path = final_output_path / "final_model.pkl"
-probabilities_path = final_output_path / "probabilities.csv" # Changed to .csv to match your to_csv save method
+probabilities_path = final_output_path / "probabilities.csv"
 cache_dir = BASE_OUT_DIR / f"{LOGIC_FILES[0]}_cache"
 predictions_dir = final_output_path / "predictions"
 feature_path=final_output_path / "features.pkl"
 metadata_path = final_output_path / "metadata.pkl"
 metadata_test_path = final_output_path / "metadata_test.pkl"
+plot_path = final_output_path / "plots"
+report_path = os.path.join(final_output_path, "experiment_log.txt")
 
 os.makedirs(predictions_dir, exist_ok=True)
 os.makedirs(final_output_path, exist_ok=True)
-report_path = os.path.join(final_output_path, "experiment_log.txt")
+
 
 with open(report_path, "a") as f:
         f.write(f"Session initialized at: {datetime.now()}\n")
         f.write(f"Modules: {', '.join(LOGIC_FILES)}\n\n")
 print(f"Outputs are configured for: {final_output_path}")
 
+# shutil.rmtree(cache_dir, ignore_errors=True)
+# print("Cleared old cache.")
+
+
 
 
 #CELL 4
-model, features, metadata, log_messages = tp.train(
-    ctx, TRAIN_SLICES, prefixes, LOGIC_FILES[0], 
-    model_path, feature_path, metadata_path, SEED, cache_dir
-)
 
-# CELL 5
-import tp_export as tp
-import importlib
-import joblib
-import os
 importlib.reload(tp)
 
-model = tp.load_model(model_path)
-features = joblib.load(feature_path)
+print("\n--- INITIATING TRAINING ---")
 
-if probabilities_path.exists():
-    os.remove(probabilities_path)
-7
+ctx.annotated = clean_full_annotations.merge(train_keys, on=['source', 'ID'], how='inner')
+
+model, features, metadata, log_messages = tp.train(
+    ctx, TRAIN_SLICES, prefixes, LOGIC_FILES[0], 
+    model_path, feature_path, metadata_path, SEED, cache_dir,
+)
+
+#CELL 5
+import tp_export as tp
+import importlib
+importlib.reload(tp)
+
+ctx.annotated = clean_full_annotations.merge(val_keys, on=['source', 'ID'], how='inner')
+
 metadata_test, log_messages_inf = tp.infer(
-    model, ctx, TEST_FILES, features, probabilities_path, 
+    model_path, ctx, TEST_FILES, feature_path, probabilities_path, 
     metadata_test_path, cache_dir, LOGIC_FILES[0]
 )
 
-# CELL 6
+#CELL 6
 import tp_export as tp
 import importlib
 importlib.reload(tp)
 
-# predict no longer needs metadata passed to it
 predictions = tp.predict(
-    probabilities_path, ppc, predictions_dir, ctx, 
-    logic_file=LOGIC_FILES[0], plot=False
+    probabilities_path, ppc, predictions_dir, ctx,
+    logic_file=LOGIC_FILES[0], plot=False, 
 )
 
-# CELL 7
+#CELL 7
 import tp_export as tp
 import importlib
 import pandas as pd
 importlib.reload(tp)
 
-ppc_id = ppc.get_IDstr() 
-pred_path = predictions_dir / f"{ppc_id}_predictions.csv"
-predictions = pd.read_csv(pred_path)
-
-for src in TEST_FILES:
-    tp.plot_source_grid(predictions, src, predictions_dir, ctx, LOGIC_FILES[0], cols=10)
+for src in prefixes:
+    tp.plot_source_grid(predictions_dir, src, predictions_dir, ppc, cols=10)
