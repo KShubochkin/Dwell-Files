@@ -29,8 +29,8 @@ _BEHAVIOR_MAP: Dict[str, str] = {
     "non_dwelling": "nondwelling",
     "crawling":     "crawling",
     "crawl":        "crawling",
-    "turning":      "nondwelling",   
-    "turn":         "nondwelling",
+    "turning":      "turning",   
+    "turn":         "turn",
     "arc":          "nondwelling",
 }
 
