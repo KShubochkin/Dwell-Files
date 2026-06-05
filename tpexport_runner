@@ -39,9 +39,11 @@ SEED = 42
 
 #postprocessing parameters
 MF = 5.166667   # median filter
-TH = 0.5        # threshold
+TH = 0.6        # threshold (same start and end)
+ST = 0.6        # start threshold
+ET = 0.6        # end threshold
 GC = 5.5        # gap close (maximum gap to fill)
-GO = 4.5        # gap opening (minimum dwell length)
+GO = 10        # gap opening (minimum dwell length)
 
 prefixes = list(TRAIN_SLICES.keys())
 #sources = list(set(prefixes).union(set(TEST_FILES)))
@@ -82,10 +84,52 @@ class PostProcessConfig:
     def get_IDstr(self):
         return f"MF{self.median_filter}_TH{self.threshold}_GC{self.gap_fill_size}_GO{self.minimum_dwell_length}"
     
+@dataclass
+class PostProcessConfig_SEthreshold: # for having different start and end thresholds
+    median_filter: float = 4
+    start_threshold: float = 0.6
+    end_threshold: float = 0.6
+    gap_fill_size: float = 5.5
+    minimum_dwell_length: float = 8
+
+    def predict(self,probs):
+        # apply median filter
+        smoothed_probs = median_filter(probs, size=int(self.median_filter * 6))
+
+        # apply hysteresis threshold
+        preds = np.zeros(len(smoothed_probs),dtype=int)
+        in_dwell = False
+
+        for i, p in enumerate(smoothed_probs):
+            if not in_dwell:
+                if p >= self.start_threshold:
+                    in_dwell = True
+            else:
+                if p <= self.end_threshold:
+                    in_dwell = False
+
+            preds[i] = int(in_dwell)    
+        
+        close_size = int(self.gap_fill_size * 6)
+        open_size = int(self.minimum_dwell_length * 6)
+        pad_len = max(close_size, open_size)
+        preds_padded = np.pad(preds, pad_width=pad_len, mode='edge')
+
+        preds_padded = binary_closing(preds_padded, structure=np.ones(close_size)).astype(int)
+        preds_padded = binary_opening(preds_padded, structure=np.ones(open_size)).astype(int)
+        
+        preds = preds_padded[pad_len:-pad_len]
+  
+        return preds
+        
+    def get_IDstr(self):
+        return f"MF{self.median_filter}_TH{self.start_threshold}_ET{self.end_threshold}_GC{self.gap_fill_size}_GO{self.minimum_dwell_length}"
+    
 ppc = PostProcessConfig(MF,TH,GC,GO)
+# ppc = PostProcessConfig_SEthreshold(MF,ST,ET,GC,GO)
 ppc_id = ppc.get_IDstr() 
 
-#validate_context(ctx)   
+#validate_context(ctx)    
 
 #CELL 3
 
