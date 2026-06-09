@@ -212,7 +212,67 @@ predictions = tp.predict(
     logic_file=LOGIC_FILES[0], plot=False, 
 )
 
-#CELL 7
+#CELL 7 - Hyperparameter tuning for postprocessing
+import random
+import tp_export as tp
+from itertools import product
+
+MF_values = [4,4.5,5]
+ST_values = [0.60,0.65,0.7]
+ET_values = [0.50,0.55,0.60,0.65]
+GC_values = [4,5.5]
+GO_values = [13,15,18]
+
+test_configs = list(product(
+    MF_values,
+    ST_values,
+    ET_values,
+    GC_values,
+    GO_values
+))
+
+random.shuffle(test_configs)
+test_configs = test_configs[:20]
+
+best_f1 = -1
+best_ppc = None
+
+for i, (MF, ST, ET, GC, GO) in enumerate(test_configs):
+
+    ppc = PostProcessConfig_SEthreshold(MF,ST,ET,GC,GO)
+    tp.predict(probabilities_path,ppc,predictions_dir,ctx,logic_file=LOGIC_FILES[0],plot=False,)
+    metrics = tp.assess_performance(predictions_dir,VAL_DIR, ppc,TRAIN_PREFIXES,sources,report_path,plot_path,dwell_tags=["wonderful"],rf_assess=True)
+    f1 = metrics["f1"]
+
+    if f1 > best_f1:
+        best_f1 = f1
+        best_ppc = ppc
+
+        print(
+            f"NEW BEST ({i}) "
+            f"F1={f1:.4f} "
+            f"{ppc.get_IDstr()}"
+        )
+
+with open(report_path, "a") as f:
+    f.write(f"\nBEST CONFIG:\n{repr(best_ppc)}\n")
+    f.write(f"BEST F1: {best_f1:.4f}\n")
+
+print("\nBEST CONFIG:")
+print(best_ppc)
+print("BEST F1:", best_f1)
+
+#CELL 8
+
+import tp_export as tp
+import importlib
+importlib.reload(tp)
+
+tp.assess_performance(predictions_dir, VAL_DIR, ppc, TRAIN_PREFIXES, sources, report_path, plot_path,
+                        dwell_tags=["wonderful"],
+                        rf_assess=True)
+
+#CELL 9
 import tp_export as tp
 import importlib
 import pandas as pd
