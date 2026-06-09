@@ -256,6 +256,10 @@ def train(
         plot_dir.mkdir(parents=True, exist_ok=True)
         fis = model.feature_importances_
         plot_gini(feature_cols,fis,plot_path)
+        # try:
+        #     plot_gini(importance_sum,plot_path,ppc_id)
+        # except:
+        #     print("Provide a plot path.")
     
     
     # ── Persist ───────────────────────────────────────────────────────────────
@@ -875,16 +879,9 @@ def assess_performance(
         fig.savefig(plot_dir / "Calibration.png", bbox_inches="tight", dpi=300); plt.close(fig)
 
         cm = confusion_matrix(gt_eval, preds_eval)
-        fig, ax = plt.subplots(figsize=(7, 6))
+        fig, ax = plt.subplots(figsize=(6, 6))
         ConfusionMatrixDisplay(cm).plot(ax=ax, cmap="Blues")
-        ax.grid(False)
         ax.set_title(f"Confusion Matrix - {ppc_id}")
-        plt.text(0.8, -0.12,
-            f"TPR/Sensitivity = {tpr:.3f}\n"
-            f"TNR/Specificity = {tnr:.3f}\n"
-            f"FPR = {fpr:.3f}",
-            transform=plt.gca().transAxes, ha="left", va="bottom", color = "#000000", fontsize=7,
-        )
         fig.savefig(plot_dir / "Confusion_Matrix.png", bbox_inches="tight", dpi=300); plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -910,6 +907,12 @@ def assess_performance(
         ax.grid(False)
         disp_e.plot(ax=ax, colorbar=True, cmap="Purples")
         ax.set_title(f"Event Confusion Matrix - {ppc_id}")
+        plt.text(0.8, -0.12,
+            f"TPR/Sensitivity = {tpr:.3f}\n"
+            f"TNR/Specificity = {tnr:.3f}\n"
+            f"FPR = {fpr:.3f}",
+            transform=plt.gca().transAxes, ha="left", va="bottom", color = "#000000", fontsize=7,
+        )
         fig.savefig(plot_dir / f"Event_Confusion_Matrix.png",bbox_inches="tight",dpi=300)
 
     with open(report_path, "a") as f:
