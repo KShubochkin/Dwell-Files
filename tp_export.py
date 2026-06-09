@@ -47,8 +47,8 @@ def load_model(model_path):
     model = joblib.load(model_path)
     print(f"Model loaded from {model_path}")
     return model
-
-def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_path,seed,cache_path):
+ 
+def train(ctx, slices, prefixes, logic_file, model_path, feature_path, metadata_path, seed,cache_path, train_keys=NotImplemented):
     
     feature_calc = importlib.import_module(logic_file)
     importlib.reload(feature_calc)
@@ -93,7 +93,32 @@ def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_pat
             ).to_parquet(save_path, index=False)
             log_messages.append(f"Saved feature cache for source: {src}")
 
-    
+    if train_keys is not None:
+        print("Filtering Universal Cache to match current Train split...")
+        
+        feature_cols = list(X.columns)
+        
+        # Combine everything so we can filter rows safely
+        full_data = mod_meta.copy()
+        full_data = pd.concat([full_data, X], axis=1)
+
+        # Ensure string matching to prevent datatype errors (e.g., 1 vs "1")
+        full_data['source'] = full_data['source'].astype(str)
+        full_data['ID'] = full_data['ID'].astype(str)
+        train_keys_copy = train_keys.copy()
+        train_keys_copy['source'] = train_keys_copy['source'].astype(str)
+        train_keys_copy['ID'] = train_keys_copy['ID'].astype(str)
+
+        # Inner merge keeps ONLY the larvae that are in the current training split
+        filtered_data = full_data.merge(train_keys_copy, on=['source', 'ID'], how='inner')
+
+        # Re-split into X, y, meta for the model
+        y = filtered_data['true_behavior']
+        groups = filtered_data['ID']
+        meta = filtered_data[['source', 'ID', 'et']]
+        mod_meta = filtered_data[['source', 'ID', 'et', 'true_behavior']]
+        X = filtered_data[feature_cols]
+        print(f"Filtered features: {len(full_data)} -> {len(X)} rows.")
     
     feature_names = list(X.columns)
     X_values = X.values.astype(np.float32)
@@ -286,7 +311,7 @@ def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False):
         if (source, track_id_str) not in df_probs.index:
             continue
         
-        if int(track_id_str) % 250 == 0: 
+        if int(track_id_str) % 1000 == 0: 
             print(f"Predicting for {source} track {track_id_str}...")
         
         track_data = df_probs.loc[(source, track_id_str)].sort_values('et')
@@ -322,13 +347,13 @@ def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False):
         print("⚠ WARNING: No matched predictions generated. Check if test IDs match inference sources.")
         return pd.DataFrame()
 
-def plot_source_grid(results_path, src, out_dir,ppc, cols=4):
+def plot_source_grid(results_path, src, out_dir,ppc, cols=10):
     """One figure per source — all larvae as a grid of small prob traces."""
-    plt.style.use('default')
-    
     ppc_id = ppc.get_IDstr() 
     pred_path = results_path / f"{ppc_id}_predictions.csv"
     results = pd.read_csv(pred_path)
+
+    plt.style.use('default')
 
     results = results.copy()
     
@@ -443,6 +468,7 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
     preds_dir = Path(preds_dir)
     val_dir = Path(val_dir)
     plot_dir = Path(plots)
+    plot_dir = plot_dir / ppc_id
     plot_dir.mkdir(parents=True, exist_ok=True) # Ensure plot directory exists
     
     pred_path = preds_dir / f"{ppc_id}_predictions.csv"
@@ -649,21 +675,33 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         # Append nicely formatted text to report
         report_lines.extend([
             "--- PREDICTION METRICS ---",
-            f"Accuracy:              {acc:.4f}",
-            f"Balanced Accuracy (BA):{ba:.4f}",
-            f"Sensitivity (TPR):     {tpr:.4f}",
-            f"Specificity (TNR):     {tnr:.4f}",
-            f"Precision (PPV):       {ppv:.4f}",
-            f"Negative Pred Val (NPV):{npv:.4f}",
-            f"F1 Score:              {f1:.4f}",
-            f"F-Beta Score (b=1):    {fbeta:.4f}",
-            f"Matthews Corrcoef:     {mcc:.4f}",
-            f"Cohen's Kappa:         {ck:.4f}",
-            f"Informedness:          {informedness:.4f}",
-            f"Markedness:            {markedness:.4f}",
-            f"Diagnostic Odds Ratio: {dor:.4f}",
-            f"Critical Success Index:{csi:.4f}",
-            f"Prevalence:            {prev:.4f}",
+            f"Accuracy:              {acc:.4f}          | the percentage of predictions a model gets right across all classifications", 
+            f"Balanced Accuracy (BA):{ba:.4f}           | the average of recall (accuracy) obtained from each individual class, primarily used to evaluate", 
+             "                                          | classification models on imbalanced datasets where one class vastly outnumbers the others",
+            f"Sensitivity (TPR):     {tpr:.4f}          | measures a model’s ability to correctly identify all actual positive cases. Also known as Recall",             
+             "                                          | or the True Positive Rate, it answers the question: “Out of all the truly positive instances in the ",
+             "                                          | data, how many did the model manage to find?",
+            f"Specificity (TNR):     {tnr:.4f}          | (or True Negative Rate) measures a model's ability to correctly identify actual negative cases. It shows ",
+             "                                          | the proportion of negatives the model avoids flagging as positive (false alarms)"
+            f"Precision (PPV):       {ppv:.4f}          | When the model predicts a positive class, how often is it actually correct?",
+            f"Negative Pred Val (NPV):{npv:.4f}         | the probability that a prediction of 'Negative' is actually correct",
+            f"F1 Score:              {f1:.4f}           | the harmonic mean of precision and recall, stays closer to the lower of the two numbers, so must be good at both",
+            f"F-Beta Score (b=1):    {fbeta:.4f}        | ",
+            f"Matthews Corrcoef:     {mcc:.4f}          | the Pearson correlation coefficient between your model’s predictions and the actual true labels, widely ",
+             "                                          | considered one of the most reliable and truthful single-number metrics in machine learning",
+            f"Cohen's Kappa:         {ck:.4f}           | how closely your classifier’s predictions match the actual ground truth, discounting the accuracy you would ",
+             "                                          | expect by pure chance"
+            f"Informedness:          {informedness:.4f} | -1 to 1; the probability that a model makes a reliable, informed decision rather than simply guessing based on chance (0)",
+            f"Markedness:            {markedness:.4f}   | -1 to 1; When the model predicts a specific class, how often is it actually right? ",
+            f"Diagnostic Odds Ratio: {dor:.4f}          | compares the model's ability to identify true signals against its susceptibility to false alarms",
+            f"Critical Success Index:{csi:.4f}          | evaluates a machine learning model's predictive accuracy for rare events; calculates the proportion of ",
+             "                                          | correctly predicted positive events out of all total actual events and incorrectly predicted events, ",
+             "                                          | intentionally ignoring the massive number of True Negatives to avoid skewed results"
+            f"Prevalence:            {prev:.4f}         | the proportion of dwelling within the total dataset",
+            f"FPR: {fpr:.4f}",
+            f"FNR:  {fnr:.4f}"
+            f"FM Index: {fm:.4f}"
+            f"FDR: {fdr:4f}"
             ""
         ])
 
