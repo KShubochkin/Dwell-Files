@@ -60,6 +60,53 @@ def _fsc_from_path_or_obj(fsc_or_path) -> FeatureSetConfig:
         return fsc_or_path
     return FeatureSetConfig.load(fsc_or_path)
 
+def plot_gini(names, imp, output_dir, num=None):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    imp = np.asarray(imp)
+    if imp.ndim == 1:
+        mean = imp
+        std = np.zeros_like(imp)
+    elif imp.ndim == 2:
+        mean = np.mean(imp, axis=0)
+        std = np.std(imp, axis=0)
+    else:
+        raise ValueError(
+            f"plot_gini expects a 1D or 2D importance array, got shape {imp.shape}"
+        )
+
+    if num is None or num > len(mean):
+        num = len(mean)
+    if len(names) != len(mean):
+        raise ValueError(
+            f"names length ({len(names)}) does not match importance length ({len(mean)})"
+        )
+
+    order = np.argsort(mean)[::-1][:num]
+    fig, ax = plt.subplots(figsize=(10, len(order) * 0.35))
+    y_pos = np.arange(len(order))
+    ax.barh(
+        y_pos,
+        mean[order][::-1],
+        xerr=std[order][::-1],
+        color='steelblue',
+        alpha=0.8,
+        align='center',
+        error_kw=dict(ecolor='black', capsize=3),
+    )
+    ax.set_yticks(y_pos)
+    name = np.asarray(names)
+    ax.set_yticklabels(name[order][::-1], fontsize=8)
+    ax.set_xlabel("Mean Decrease in Impurity (std across trees)")
+    ax.set_title("Feature Importances")
+    plt.tight_layout()
+    ax.grid(False)
+    ppath = output_dir / "feature_importance.png"
+    fig.savefig(ppath, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    print(f"Feature Importances plotted → {ppath}")
+
 @dataclass
 class PostProcessConfig:
     median_filter: float = 5.166667
@@ -96,6 +143,8 @@ def train(
     cache_dir,
     fsc: FeatureSetConfig,
     train_keys=None,
+    do_plot_gini=False,
+    plot_path=None,
 ):
     """
     Train a RandomForest classifier.
@@ -201,7 +250,14 @@ def train(
         oob_score=True,
     )
     model.fit(X_train.values, y.values)
-
+    
+    if do_plot_gini:
+        plot_dir  = Path(plot_path)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        fis = model.feature_importances_
+        plot_gini(feature_cols,fis,plot_path)
+    
+    
     # ── Persist ───────────────────────────────────────────────────────────────
     joblib.dump(model,  model_path);   print(f"Model saved      → {model_path}")
     joblib.dump(fsc,    feature_path); print(f"FSC saved        → {feature_path}")
