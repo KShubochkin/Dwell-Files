@@ -48,14 +48,13 @@ def load_model(model_path):
     print(f"Model loaded from {model_path}")
     return model
 
-def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_path,seed,cache_path,train_keys=None):
+def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_path,seed,cache_path):
     
     feature_calc = importlib.import_module(logic_file)
     importlib.reload(feature_calc)
     
     cache_path = Path(cache_path)
     cache_dir = _resolve_cache_dir(cache_path)
-    
     if _feature_cache_files_exist(cache_path, prefixes,mode="train"):
         print("Loading features from cache...")
         X_list, y_list, groups_list, meta_list, log_messages = [], [], [], [], []
@@ -94,38 +93,12 @@ def train(ctx, slices, prefixes, logic_file,model_path,feature_path,metadata_pat
             ).to_parquet(save_path, index=False)
             log_messages.append(f"Saved feature cache for source: {src}")
 
-    if train_keys is not None:
-        print("Filtering Universal Cache to match current Train split...")
-        
-        feature_cols = list(X.columns)
-        
-        # Combine everything so we can filter rows safely
-        full_data = mod_meta.copy()
-        full_data = pd.concat([full_data, X], axis=1)
-
-        # Ensure string matching to prevent datatype errors (e.g., 1 vs "1")
-        full_data['source'] = full_data['source'].astype(str)
-        full_data['ID'] = full_data['ID'].astype(str)
-        train_keys_copy = train_keys.copy()
-        train_keys_copy['source'] = train_keys_copy['source'].astype(str)
-        train_keys_copy['ID'] = train_keys_copy['ID'].astype(str)
-
-        # Inner merge keeps ONLY the larvae that are in the current training split
-        filtered_data = full_data.merge(train_keys_copy, on=['source', 'ID'], how='inner')
-
-        # Re-split into X, y, meta for the model
-        y = filtered_data['true_behavior']
-        groups = filtered_data['ID']
-        meta = filtered_data[['source', 'ID', 'et']]
-        mod_meta = filtered_data[['source', 'ID', 'et', 'true_behavior']]
-        X = filtered_data[feature_cols]
-        print(f"Filtered features: {len(full_data)} -> {len(X)} rows.")
-
+    
+    
     feature_names = list(X.columns)
     X_values = X.values.astype(np.float32)
     y_values = y.values.astype(np.int32)
     groups_arr = np.array(groups)
-    
     
     print("Training model...")
     
@@ -313,7 +286,7 @@ def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False):
         if (source, track_id_str) not in df_probs.index:
             continue
         
-        if int(track_id_str) % 1000 == 0: 
+        if int(track_id_str) % 250 == 0: 
             print(f"Predicting for {source} track {track_id_str}...")
         
         track_data = df_probs.loc[(source, track_id_str)].sort_values('et')
@@ -349,13 +322,13 @@ def predict(probabilities_path, ppc, predictions_dir,ctx,logic_file,plot=False):
         print("⚠ WARNING: No matched predictions generated. Check if test IDs match inference sources.")
         return pd.DataFrame()
 
-def plot_source_grid(results_path, src, out_dir,ppc, cols=10):
+def plot_source_grid(results_path, src, out_dir,ppc, cols=4):
     """One figure per source — all larvae as a grid of small prob traces."""
+    plt.style.use('default')
+    
     ppc_id = ppc.get_IDstr() 
     pred_path = results_path / f"{ppc_id}_predictions.csv"
     results = pd.read_csv(pred_path)
-    
-    plt.style.use('default')
 
     results = results.copy()
     
@@ -470,7 +443,6 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
     preds_dir = Path(preds_dir)
     val_dir = Path(val_dir)
     plot_dir = Path(plots)
-    plot_dir = plot_dir / ppc_id
     plot_dir.mkdir(parents=True, exist_ok=True) # Ensure plot directory exists
     
     pred_path = preds_dir / f"{ppc_id}_predictions.csv"
@@ -498,6 +470,75 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         tns = (nd == 1) & (preds == 0)    # True Negatives
         
         return tps.sum(), tns.sum(), fps.sum(), fns.sum(), dwell.sum(), nd.sum()
+    
+    def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5):
+        """
+        Computes event-based TP, FP, FN by aggregating overlapping predictions
+        per GT interval to avoid falsely punishing fragmented predictions as FPs.
+        """
+        from scipy.ndimage import label
+        import numpy as np
+        
+        meta_df = meta_df.reset_index(drop=True)
+        groups = (meta_df['source'] + "_" + meta_df['ID'].astype(str)).values
+        
+        tp = 0
+        fn = 0
+        fp = 0
+        
+        for g in np.unique(groups):
+            mask = groups == g
+            g_et = meta_df.loc[mask, 'et'].values
+            gap_locs = np.where(np.diff(g_et) > 0.5)[0] + 1
+            
+            y_true_seg_list = np.split(y_true[mask], gap_locs)
+            y_pred_seg_list = np.split(y_pred[mask], gap_locs)
+            
+            for yt_seg, yp_seg in zip(y_true_seg_list, y_pred_seg_list):
+                if len(yt_seg) == 0:
+                    continue
+                    
+                gt_labels, num_gt = label(yt_seg)
+                pred_labels, num_pred = label(yp_seg)
+                
+                # Keep track of which predicted labels are 'whitelisted' as useful
+                whitelisted_preds = set()
+                # Keep track of predicted labels that touched failed GT intervals
+                tainted_preds = set()
+                
+                # Evaluate Ground Truth Events first
+                for gt_idx in range(1, num_gt + 1):
+                    gt_mask = (gt_labels == gt_idx)
+                    gt_len = np.sum(gt_mask)
+                    
+                    # Identify all predicted events overlapping this specific GT interval
+                    overlapping_preds = np.unique(pred_labels[gt_mask])
+                    overlapping_preds = overlapping_preds[overlapping_preds != 0]
+                    
+                    # Calculate aggregated overlap frames from ALL intersecting predictions
+                    total_overlap_frames = 0
+                    for p_idx in overlapping_preds:
+                        pred_mask = (pred_labels == p_idx)
+                        total_overlap_frames += np.sum(gt_mask & pred_mask)
+                    
+                    aggregate_overlap_pct = total_overlap_frames / gt_len
+                    
+                    if aggregate_overlap_pct >= overlap_threshold:
+                        tp += 1
+                        # Whitelist EVERY prediction interval that contributed to this success
+                        for p_idx in overlapping_preds:
+                            whitelisted_preds.add(p_idx)
+                    else:
+                        fn += 1
+                        # Mark these predictions as having touched a failed GT event
+                
+                # Evaluate Predicted Events for False Positives
+                for p_idx in range(1, num_pred + 1):
+                    # An interval is a False Positive if it wasn't part of any successful TP
+                    if p_idx not in whitelisted_preds:
+                        fp += 1
+
+        return tp, fp, fn
         
     def expected_calibration_error(y_true, y_prob, n_bins=10):
         prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy='uniform')
@@ -608,38 +649,27 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         # Append nicely formatted text to report
         report_lines.extend([
             "--- PREDICTION METRICS ---",
-            f"Accuracy:              {acc:.4f}          | the percentage of predictions a model gets right across all classifications", 
-            f"Balanced Accuracy (BA):{ba:.4f}           | the average of recall (accuracy) obtained from each individual class, primarily used to evaluate", 
-             "                                          | classification models on imbalanced datasets where one class vastly outnumbers the others",
-            f"Sensitivity (TPR):     {tpr:.4f}          | measures a model’s ability to correctly identify all actual positive cases. Also known as Recall",             
-             "                                          | or the True Positive Rate, it answers the question: “Out of all the truly positive instances in the ",
-             "                                          | data, how many did the model manage to find?",
-            f"Specificity (TNR):     {tnr:.4f}          | (or True Negative Rate) measures a model's ability to correctly identify actual negative cases. It shows ",
-             "                                          | the proportion of negatives the model avoids flagging as positive (false alarms)"
-            f"Precision (PPV):       {ppv:.4f}          | When the model predicts a positive class, how often is it actually correct?",
-            f"Negative Pred Val (NPV):{npv:.4f}         | the probability that a prediction of 'Negative' is actually correct",
-            f"F1 Score:              {f1:.4f}           | the harmonic mean of precision and recall, stays closer to the lower of the two numbers, so must be good at both",
-            f"F-Beta Score (b=1):    {fbeta:.4f}        | ",
-            f"Matthews Corrcoef:     {mcc:.4f}          | the Pearson correlation coefficient between your model’s predictions and the actual true labels, widely ",
-             "                                          | considered one of the most reliable and truthful single-number metrics in machine learning",
-            f"Cohen's Kappa:         {ck:.4f}           | how closely your classifier’s predictions match the actual ground truth, discounting the accuracy you would ",
-             "                                          | expect by pure chance"
-            f"Informedness:          {informedness:.4f} | -1 to 1; the probability that a model makes a reliable, informed decision rather than simply guessing based on chance (0)",
-            f"Markedness:            {markedness:.4f}   | -1 to 1; When the model predicts a specific class, how often is it actually right? ",
-            f"Diagnostic Odds Ratio: {dor:.4f}          | compares the model's ability to identify true signals against its susceptibility to false alarms",
-            f"Critical Success Index:{csi:.4f}          | evaluates a machine learning model's predictive accuracy for rare events; calculates the proportion of ",
-             "                                          | correctly predicted positive events out of all total actual events and incorrectly predicted events, ",
-             "                                          | intentionally ignoring the massive number of True Negatives to avoid skewed results"
-            f"Prevalence:            {prev:.4f}         | the proportion of dwelling within the total dataset",
-            f"FPR: {fpr:.4f}",
-            f"FNR:  {fnr:.4f}"
-            f"FM Index: {fm:.4f}"
-            f"FDR: {fdr:4f}"
+            f"Accuracy:              {acc:.4f}",
+            f"Balanced Accuracy (BA):{ba:.4f}",
+            f"Sensitivity (TPR):     {tpr:.4f}",
+            f"Specificity (TNR):     {tnr:.4f}",
+            f"Precision (PPV):       {ppv:.4f}",
+            f"Negative Pred Val (NPV):{npv:.4f}",
+            f"F1 Score:              {f1:.4f}",
+            f"F-Beta Score (b=1):    {fbeta:.4f}",
+            f"Matthews Corrcoef:     {mcc:.4f}",
+            f"Cohen's Kappa:         {ck:.4f}",
+            f"Informedness:          {informedness:.4f}",
+            f"Markedness:            {markedness:.4f}",
+            f"Diagnostic Odds Ratio: {dor:.4f}",
+            f"Critical Success Index:{csi:.4f}",
+            f"Prevalence:            {prev:.4f}",
             ""
         ])
 
     # 3. Probability Assessment (Continuous Metrics & Visuals)
     if prob_assess:
+        # Use the filtered evaluation arrays!
         pointwise_log_loss = -(gt_eval * np.log(np.clip(probs_eval, 1e-15, 1-1e-15)) + (1 - gt_eval) * np.log(1 - np.clip(probs_eval, 1e-15, 1-1e-15)))
         
         brier = brier_score_loss(gt_eval, probs_eval)
@@ -663,7 +693,7 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         fig, ax = plt.subplots(figsize=(6, 6))
         RocCurveDisplay(fpr=fpr, tpr=tpr_curve, roc_auc=auroc).plot(ax=ax)
         ax.set_title(f"ROC Curve - {ppc_id}")
-        fig.savefig(plot_dir / f"ROC_Curve.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_ROC_Curve.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
         # Precision-Recall Curve
@@ -671,7 +701,7 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         fig, ax = plt.subplots(figsize=(6, 6))
         PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap).plot(ax=ax)
         ax.set_title(f"Precision-Recall Curve - {ppc_id}")
-        fig.savefig(plot_dir / f"PR_Curve.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_PR_Curve.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
         # Calibration Curve
@@ -679,22 +709,39 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         fig, ax = plt.subplots(figsize=(6, 6))
         CalibrationDisplay(prob_true, prob_pred, probs_eval).plot(ax=ax)
         ax.set_title(f"Calibration Curve - {ppc_id}")
-        fig.savefig(plot_dir / f"Calibration.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_Calibration.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
         # Confusion Matrix
         cm = confusion_matrix(gt_eval, preds_eval)
         fig, ax = plt.subplots(figsize=(6, 6))
         ConfusionMatrixDisplay(cm).plot(ax=ax, cmap='Blues')
+        ax.grid(False)
         ax.set_title(f"Confusion Matrix - {ppc_id}")
-        fig.savefig(plot_dir / f"Confusion_Matrix.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_Confusion_Matrix.png", bbox_inches='tight', dpi=300)
+        plt.close(fig)
+
+        # Event pseudo confusion matrix
+        meta_eval = results.loc[eval_mask, ['source', 'ID', 'et']].reset_index(drop=True)
+        tp_ev, fp_ev, fn_ev = event_confusion_matrix(gt_eval, preds_eval, meta_eval, overlap_threshold=0.3)
+        
+        cm_events = np.array([[0, fp_ev], 
+                            [fn_ev, tp_ev]])
+        
+        fig, ax = plt.subplots(figsize=(7, 6))
+        disp_e = ConfusionMatrixDisplay(cm_events,display_labels=["No Event", "Event"])
+        ax.grid(False)
+        disp_e.plot(ax=ax, colorbar=True, cmap="Purples")
+        ax.set_title(f"Event Confusion Matrix - {ppc_id}")
+
+        fig.savefig(plot_dir / f"{ppc_id}_Event_Confusion_Matrix.png",bbox_inches="tight",dpi=300)
         plt.close(fig)
         
         # DET Curve
         fig, ax = plt.subplots(figsize=(6, 6))
         DetCurveDisplay.from_predictions(gt_eval, probs_eval, ax=ax)
         ax.set_title(f"DET Curve - {ppc_id}")
-        fig.savefig(plot_dir / f"DET_Curve.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_DET_Curve.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
         # Cumulative Gain & Lift Curves
@@ -702,16 +749,21 @@ def assess_performance(preds_dir,val_dir, ppc, prefixes, sources, report_path, p
         
         fig, ax = plt.subplots(figsize=(7, 6))
         plot_cumulative_gain(gt_eval, probs_2d, ax=ax)
-        fig.savefig(plot_dir / f"Cumulative_Gain.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_Cumulative_Gain.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(7, 6))
         plot_lift_curve(gt_eval, probs_2d, ax=ax)
-        fig.savefig(plot_dir / f"Lift_Curve.png", bbox_inches='tight', dpi=300)
+        fig.savefig(plot_dir / f"{ppc_id}_Lift_Curve.png", bbox_inches='tight', dpi=300)
         plt.close(fig)
+
 
     # Append to Output Text File
     with open(report_path, 'a') as f:
         f.write("\n".join(report_lines) + "\n")
-        
-    return True
+
+    return {"f1": f1,
+            "precision": ppv,
+            "recall/sensitivity": tpr}
+
+    
