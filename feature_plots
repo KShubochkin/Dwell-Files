@@ -1,0 +1,204 @@
+# feature_plots
+
+'''
+Builds plots showing:
+1. wonderful dwelling trajectories
+2. model predicted probabilities
+3. feature change over time
+'''
+
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+import matplotlib.patheffects as pe
+import numpy as np
+from tp_export import PostProcessConfig
+
+def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, source, larva_id, start_time, feature_list=[], plot_name=''):
+
+    feat_prob_df = feat_prob_by_source[source]
+
+    # Find annotation event
+    event = ann_df[
+        (ann_df["source"] == source) &
+        (ann_df["ID"] == larva_id) &
+        (ann_df["behavior"] == "dwelling") &
+        (abs(ann_df["t0_sec"] - start_time) < 0.01)
+    ].iloc[0]
+
+    # --- Determine plotting window ---
+    # Include +/- 50s outside of dwelling, but crop to avoid including another dwelling event in the window
+    dwell_start = event["t0_sec"]
+    dwell_end = event["t1_sec"]
+
+    larva_traj = traj_df[
+        (traj_df["source"] == source) &
+        (traj_df["ID"] == larva_id)
+    ]
+    max_time = larva_traj["et"].max()
+
+    PRE_WINDOW = 50
+    POST_WINDOW = 50
+
+    window_start = max(dwell_start - PRE_WINDOW, 0)
+    window_end = min(dwell_end + POST_WINDOW, max_time)
+
+    # Find all dwelling events for this larva
+    larva_events = ann_df[
+        (ann_df["source"] == source) &
+        (ann_df["ID"] == larva_id) &
+        (ann_df["behavior"] == "dwelling")
+    ].sort_values("t0_sec")
+
+    prev_events = larva_events[larva_events["t1_sec"] < dwell_start]
+
+    if len(prev_events) > 0:
+        prev_end = prev_events["t1_sec"].max()
+        window_start = max(window_start, prev_end)
+
+    post_events = larva_events[larva_events["t0_sec"] > dwell_end]
+
+    if len(post_events) > 0:
+        post_start = post_events["t0_sec"].min()
+        window_end = min(window_end, post_start)
+
+    print(f"dwell: {dwell_start:.2f}-{dwell_end:.2f}s")
+    print(f"window: {window_start:.2f}-{window_end:.2f}s")
+
+    # --- Extract data ---
+    traj_seg = traj_df[
+        (traj_df["source"] == source) &
+        (traj_df["ID"] == larva_id) &
+        (traj_df["et"] >= window_start) &
+        (traj_df["et"] <= window_end)
+    ].copy()
+
+    traj_seg["is_dwelling"] = (
+        (traj_seg["et"] >= dwell_start) &
+        (traj_seg["et"] <= dwell_end)
+    )
+
+    plot_seg = feat_prob_df[
+        (feat_prob_df["source"] == source) &
+        (feat_prob_df["ID"] == larva_id) &
+        (feat_prob_df["et"] >= window_start) &
+        (feat_prob_df["et"] <= window_end)
+    ].copy()
+
+    # --- Create figure ---
+    n_features = len(feature_list)
+    fig_height = 6 + 2.5 * n_features
+    height_ratios = [2.4, 1] + [1] * n_features
+    fig, axes = plt.subplots(n_features + 2, 1, figsize=(10, fig_height), gridspec_kw={"height_ratios": height_ratios})
+
+    ax_traj = axes[0]
+    ax_prob = axes[1]
+    ax_feat = axes[2:]
+
+    # ==================================================
+    # TRAJECTORY PANEL
+    # ==================================================
+    non = traj_seg[~traj_seg["is_dwelling"]]
+    dwell = traj_seg[traj_seg["is_dwelling"]]
+
+    duration = dwell_end - dwell_start
+
+    ax_traj.set_title(
+        f"{source} | ID {larva_id} | "
+        f"Dwelling: {dwell_start:.1f}s → {dwell_end:.1f}s "
+        f"({duration:.1f}s)"
+    )
+
+    ax_traj.set_xlabel("x (mm)")
+    ax_traj.set_ylabel("y (mm)")
+
+    # plot trajectories
+    ax_traj.plot(traj_seg["x"], traj_seg["y"], color="purple", linewidth=2, zorder=1)
+    ax_traj.plot(dwell["x"], dwell["y"], color="green", linewidth=3, zorder=2)
+
+    # dots for start and end
+    ax_traj.scatter(traj_seg.iloc[0]["x"], traj_seg.iloc[0]["y"], color="orange", s=120, zorder=10)
+    ax_traj.scatter(traj_seg.iloc[-1]["x"], traj_seg.iloc[-1]["y"], color="darkturquoise", s=120, zorder=10)
+
+    # label time points
+    TIME_MARKER_STEP = 5
+    times = np.arange(
+        np.ceil(window_start / TIME_MARKER_STEP) * TIME_MARKER_STEP,
+        window_end,
+        TIME_MARKER_STEP
+    )
+
+    for tt in times:
+        idx = np.argmin(np.abs(traj_seg["et"].values - tt))
+        row = traj_seg.iloc[idx]
+        time_txt = ax_traj.text(row["x"], row["y"], f"{tt:.1f}s", fontsize=8, ha="left", va="bottom", color="black", zorder=10)
+        time_txt.set_path_effects([pe.Stroke(linewidth=3.5, foreground="white", alpha=0.5), pe.Normal()])
+        ax_traj.plot(row["x"], row["y"], "o", ms=4, mfc="none", mec="black", zorder=6)
+
+    # larva length bar: calculated as median of sum of spine distances across all frames in this larva's trajectory
+    spine_x = larva_traj[[f"xspine_{i}" for i in range(11)]].values
+    spine_y = larva_traj[[f"yspine_{i}" for i in range(11)]].values
+
+    segment_lengths = np.sqrt(np.diff(spine_x, axis=1)**2 +np.diff(spine_y, axis=1)**2)
+    frame_lengths = segment_lengths.sum(axis=1)
+    larva_length = np.median(frame_lengths)
+
+    x_min, x_max = ax_traj.get_xlim()
+    y_min, y_max = ax_traj.get_ylim()
+    bar_x = x_min + 0.85 * (x_max - x_min)
+    bar_y = y_min + 0.08 * (y_max - y_min)
+
+    ax_traj.plot([bar_x, bar_x + larva_length], [bar_y, bar_y], color="gray", linewidth=4)
+    ax_traj.text(bar_x + larva_length/2, bar_y - 0.02*(y_max-y_min), f"larva length: {larva_length:.2f} mm", ha="center", va="top", fontsize=9, bbox=dict(facecolor="white", alpha=0.7, pad = 0.1, edgecolor="none"))
+
+    # legend
+    legend_traj = [
+        Line2D([0], [0], color="green", linewidth=3, label="GT Dwelling"),
+        Line2D( [0], [0], color="purple", linewidth=2,label="Non-dwelling"),
+        Line2D([0], [0],  marker="o", color="orange", linestyle="None", markersize=8, label="Window start"),
+        Line2D([0], [0], marker="o", color="darkturquoise", linestyle="None", markersize=8, label="Window end")
+    ]
+    ax_traj.legend(handles=legend_traj, fontsize=8, framealpha=0.9)
+
+    
+    # ==================================================
+    # PROBABILITY PANEL
+    # ==================================================
+    # post processing 
+    ppc = PostProcessConfig(
+        median_filter=5,
+        threshold=0.6,
+        gap_fill_size=5.5,
+        minimum_dwell_length=13
+    )
+    plot_seg["pred_binary"] = ppc.predict(plot_seg["prob"].values)
+    
+    # plot
+    ax_prob.set_ylim(-0.01, 1.01)
+    ax_prob.set_xlabel("Time (s)")
+    ax_prob.set_ylabel("Probability")
+
+    ax_prob.plot(plot_seg["et"], plot_seg["prob"].values, linewidth=2, label = "Predicted probability")
+    ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2)
+    ax_prob.step(plot_seg["et"], plot_seg["pred_binary"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label="Binary prediction (Threshold=0.6)")
+
+    legend_prob = ax_prob.legend(fontsize=8, framealpha=0.5)
+
+    # ==================================================
+    # FEATURE PANELS
+    # ==================================================
+
+    for ax, feature in zip(ax_feat, feature_list):
+        ax.plot(plot_seg["et"], plot_seg[feature], linewidth=2)
+        ax.axvspan(dwell_start, dwell_end, alpha=0.2)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(feature)
+        ax_feat[-1].set_xlabel("Time (s)")
+
+    
+    plt.tight_layout()
+
+    save_path = output_dir / (f"{source}_ID{larva_id}_dwell_{int(dwell_start)}-{int(dwell_end)}s_{plot_name}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Feature plots saved -> {save_path}")
