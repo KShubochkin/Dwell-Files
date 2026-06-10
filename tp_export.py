@@ -84,6 +84,8 @@ def plot_gini(names, imp, output_dir, num=None):
         )
 
     order = np.argsort(mean)[::-1][:num]
+    ranked_features = list(np.asarray(names)[order])
+
     fig, ax = plt.subplots(figsize=(10, len(order) * 0.35))
     y_pos = np.arange(len(order))
     ax.barh(
@@ -106,6 +108,7 @@ def plot_gini(names, imp, output_dir, num=None):
     fig.savefig(ppath, bbox_inches="tight", dpi=300)
     plt.close(fig)
     print(f"Feature Importances plotted → {ppath}")
+    return ranked_features
 
 @dataclass
 class PostProcessConfig:
@@ -255,7 +258,12 @@ def train(
         plot_dir  = Path(plot_path)
         plot_dir.mkdir(parents=True, exist_ok=True)
         fis = model.feature_importances_
-        plot_gini(feature_cols,fis,plot_path)
+        ranked_features = plot_gini(feature_cols,fis,plot_path)
+        
+        with open(plot_path / "feature_ranking.txt", "w") as f:
+            for feat in ranked_features:
+                f.write(feat + "\n")
+
         # try:
         #     plot_gini(importance_sum,plot_path,ppc_id)
         # except:
