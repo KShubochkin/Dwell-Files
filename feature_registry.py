@@ -717,6 +717,10 @@ def calculate_columns(
             feat_out[feat_name] = fdef.fn(df, feat_out, fps, g_inst)
 
     # ── Per-window targeted pass ──────────────────────────────────────────────
+    # List to collect our dataframes before doing ONE final concat
+    collected_frames = [feat_out]
+
+    # ── Per-window targeted pass ──────────────────────────────────────────────
     for w, feat_names_wanted in wanted.items():
         if w is None:
             continue
@@ -725,7 +729,6 @@ def calculate_columns(
         g_win  = g_inst.rolling(window=int(w * fps), min_periods=1, center=True)
 
         # Collect the wanted features + all their transitive prereqs (for this window)
-        # Prereqs are computed into a scratch frame but NOT emitted in output.
         def _collect_with_prereqs(name: str, seen: set) -> List[str]:
             if name in seen:
                 return []
@@ -753,13 +756,21 @@ def calculate_columns(
             col = f"w{w}_{fdef.name}"
             feat_win[col] = fdef.fn(df, feat_win, w, fps, g_inst, g_win, groups_ser)
 
-        # Only emit the columns that were explicitly requested
-        for feat_name in feat_names_wanted:
-            col = f"w{w}_{feat_name}"
-            if col in feat_win.columns:
-                feat_out[col] = feat_win[col]
+        cols_to_keep = [f"w{w}_{feat_name}" for feat_name in feat_names_wanted]
+        cols_to_keep = [c for c in cols_to_keep if c in feat_win.columns]
+        
+        if cols_to_keep:
+            chunk = feat_win[cols_to_keep].reset_index(drop=True)
+            collected_frames.append(chunk)
 
         del g_inst, g_win, feat_win
         gc.collect()
 
-    return feat_out.astype("float32")
+    collected_frames[0].reset_index(drop=True, inplace=True)
+    
+    final_out = pd.concat(collected_frames, axis=1)
+    
+    # Restore the original dataframe index
+    final_out.index = df.index
+
+    return final_out.astype("float32").copy()
