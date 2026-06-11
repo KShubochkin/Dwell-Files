@@ -1,287 +1,130 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "7f554669",
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stderr",
-     "output_type": "stream",
-     "text": [
-      "C:\\Users\\Tomoko\\AppData\\Local\\Temp\\ipykernel_51116\\515257162.py:28: DtypeWarning: Columns (0: behavior, 1: tags) have mixed types. Specify dtype option on import or set low_memory=False.\n",
-      "  prob = pd.read_csv(PROBABILITIES)\n"
-     ]
+# feature_plots_runner
+
+#CELL 1 - load files
+
+import pandas as pd
+from pathlib import Path
+
+ANN_MASTER  = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs\annotation.csv")
+SESSION_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
+PARQUET_PATH = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\raw_trajectories.parquet")
+MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260610_131215_train-GA1-GA3-GA2-EA-H2O")
+#MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\feature_calculation_cache")
+MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\master_feature_cache")
+PROBABILITIES = MODEL_DIR / "probabilities.csv"
+
+OUTPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\feature_plots")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# raw trajectories 
+traj_df = pd.read_parquet(PARQUET_PATH)
+
+# full annotations
+ann_df = pd.concat(
+    [pd.read_csv(f)
+     for f in Path(SESSION_DIR).glob("*.csv")],
+    ignore_index=True
+)
+
+# model infer features and probabilities
+prob = pd.read_csv(PROBABILITIES)
+feature_files = list(MODEL_CACHE_DIR.glob("features_*.parquet"))
+feature_dfs = {}
+
+# for f in feature_files:
+#     source = f.stem.replace("features_", "").replace("_infer", "")
+#     feature_dfs[source] = pd.read_parquet(f)
+
+for f in feature_files:
+    source = f.stem.replace("features_", "")
+    feature_dfs[source] = pd.read_parquet(f)
+
+feat_prob_by_source = {}
+for source, feat_df in feature_dfs.items():
+    merged = feat_df.merge(prob, on=["source", "ID", "et"], how="inner")
+    feat_prob_by_source[source] = merged
+
+
+#CELL 2 - view dfs
+
+with pd.option_context('display.expand_frame_repr', False):
+    print("traj_df","\n", traj_df.head())
+    print("\nann_df", "\n", ann_df.head())
+    for source, feat_df in feature_dfs.items():
+        print(f"\nfeatures: {source}\n",feat_df.head())
+    print("\nprobabilities\n", prob.head())
+
+
+
+# CELL 3 - Run single larva plot
+
+import feature_plots as fp
+import importlib
+importlib.reload(fp)
+
+ranked_features = pd.read_csv(MODEL_DIR /"plots"/"feature_ranking.txt", header=None)[0].tolist()
+
+# Input features to be plotted (this is plotting everything)
+plot_features = [
+    c for c in feat_prob_by_source["H2O"].columns
+    if c not in {
+        "source",
+        "ID",
+        "et",
+        "prob",
+        "behavior",
+        "tags",
+        "true_label"
     }
-   ],
-   "source": [
-    "# feature_plots_runner\n",
-    "\n",
-    "#CELL 1 - load files\n",
-    "\n",
-    "import pandas as pd\n",
-    "from pathlib import Path\n",
-    "\n",
-    "ANN_MASTER  = Path(r\"C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\annotation\\annotation_csvs\\annotation.csv\")\n",
-    "SESSION_DIR = Path(r\"C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\annotation\\annotation_csvs_all\")\n",
-    "PARQUET_PATH = Path(r\"C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\raw_trajectories.parquet\")\n",
-    "MODEL_DIR = Path(r\"C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\RUN_feature_registry_test_20260610_131215_train-GA1-GA3-GA2-EA-H2O\")\n",
-    "MODEL_CACHE_DIR = Path(r\"C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_calculation_cache\")\n",
-    "PROBABILITIES = MODEL_DIR / \"probabilities.csv\"\n",
-    "\n",
-    "OUTPUT_DIR = Path(r\"C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\")\n",
-    "OUTPUT_DIR.mkdir(exist_ok=True)\n",
-    "\n",
-    "# raw trajectories \n",
-    "traj_df = pd.read_parquet(PARQUET_PATH)\n",
-    "\n",
-    "# full annotations\n",
-    "ann_df = pd.concat(\n",
-    "    [pd.read_csv(f)\n",
-    "     for f in Path(SESSION_DIR).glob(\"*.csv\")],\n",
-    "    ignore_index=True\n",
-    ")\n",
-    "\n",
-    "# model infer features and probabilities\n",
-    "prob = pd.read_csv(PROBABILITIES)\n",
-    "feature_files = list(MODEL_CACHE_DIR.glob(\"features_*_infer.parquet\"))\n",
-    "feature_dfs = {}\n",
-    "\n",
-    "for f in feature_files:\n",
-    "    source = f.stem.replace(\"features_\", \"\").replace(\"_infer\", \"\")\n",
-    "    feature_dfs[source] = pd.read_parquet(f)\n",
-    "\n",
-    "feat_prob_by_source = {}\n",
-    "for source, feat_df in feature_dfs.items():\n",
-    "    merged = feat_df.merge(prob, on=[\"source\", \"ID\", \"et\"], how=\"inner\")\n",
-    "    feat_prob_by_source[source] = merged\n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "72bddaf9",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "#CELL 2 - view dfs\n",
-    "\n",
-    "with pd.option_context('display.expand_frame_repr', False):\n",
-    "    print(\"traj_df\",\"\\n\", traj_df.head())\n",
-    "    print(\"\\nann_df\", \"\\n\", ann_df.head())\n",
-    "    for source, feat_df in feature_dfs.items():\n",
-    "        print(f\"\\nfeatures: {source}\\n\",feat_df.head())\n",
-    "    print(\"\\nprobabilities\\n\", prob.head())"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "0f73b9a8",
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "dwell: 186.942-229.025s\n",
-      "window: 136.942-229.025s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID999_dwell_186-229s_all_features.png\n"
-     ]
-    }
-   ],
-   "source": [
-    "# CELL 3 - Run single larva plot\n",
-    "\n",
-    "import feature_plots as fp\n",
-    "import importlib\n",
-    "importlib.reload(fp)\n",
-    "\n",
-    "ranked_features = pd.read_csv(MODEL_DIR /\"plots\"/\"feature_ranking.txt\", header=None)[0].tolist()\n",
-    "\n",
-    "# Input features to be plotted (this is plotting everything)\n",
-    "plot_features = [\n",
-    "    c for c in feat_prob_by_source[\"H2O\"].columns\n",
-    "    if c not in {\n",
-    "        \"source\",\n",
-    "        \"ID\",\n",
-    "        \"et\",\n",
-    "        \"prob\",\n",
-    "        \"behavior\",\n",
-    "        \"tags\",\n",
-    "        \"true_label\"\n",
-    "    }\n",
-    "]\n",
-    "\n",
-    "# top 10 features\n",
-    "# plot_features = ranked_features[:10]\n",
-    "\n",
-    "ranked_plot_features = [f for f in ranked_features if f in plot_features]\n",
-    "\n",
-    "# Plotting selected features in order descending according to GINI feature importance, as calculated during model training\n",
-    "fp.plot_dwelling_segment(\n",
-    "    ann_df = ann_df,\n",
-    "    traj_df = traj_df,\n",
-    "    feat_prob_by_source = feat_prob_by_source,\n",
-    "    output_dir = OUTPUT_DIR,\n",
-    "    source = \"GA1\",\n",
-    "    larva_id = 999,\n",
-    "    start_time = 186.942,\n",
-    "    feature_list = ranked_plot_features,\n",
-    "    plot_name = \"all_features\",\n",
-    ")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "a19ba7e4",
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "Found 223 wonderful dwellings\n",
-      "EA | ID=18 | start=0.659\n",
-      "dwell: 0.66-66.03s\n",
-      "window: 0.00-66.03s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID18_dwell_0-66s_top10_gini.png\n",
-      "EA | ID=41 | start=142.063\n",
-      "dwell: 142.06-178.02s\n",
-      "window: 92.06-219.92s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID41_dwell_142-178s_top10_gini.png\n",
-      "EA | ID=41 | start=219.918\n",
-      "dwell: 219.92-240.07s\n",
-      "window: 178.02-256.02s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID41_dwell_219-240s_top10_gini.png\n",
-      "EA | ID=44 | start=108.964\n",
-      "dwell: 108.96-163.36s\n",
-      "window: 58.96-163.36s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID44_dwell_108-163s_top10_gini.png\n",
-      "EA | ID=49 | start=33.265\n",
-      "dwell: 33.27-68.03s\n",
-      "window: 0.00-81.17s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID49_dwell_33-68s_top10_gini.png\n",
-      "EA | ID=54 | start=265.997\n",
-      "dwell: 266.00-400.58s\n",
-      "window: 216.00-400.58s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID54_dwell_265-400s_top10_gini.png\n",
-      "EA | ID=66 | start=70.527\n",
-      "dwell: 70.53-107.46s\n",
-      "window: 20.53-157.46s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID66_dwell_70-107s_top10_gini.png\n",
-      "EA | ID=66 | start=162.532\n",
-      "dwell: 162.53-330.05s\n",
-      "window: 112.53-380.05s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID66_dwell_162-330s_top10_gini.png\n",
-      "EA | ID=139 | start=481.940\n",
-      "dwell: 481.94-515.04s\n",
-      "window: 431.94-565.04s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID139_dwell_481-515s_top10_gini.png\n",
-      "EA | ID=2284 | start=183.450\n",
-      "dwell: 183.45-214.06s\n",
-      "window: 133.45-264.06s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\EA_ID2284_dwell_183-214s_top10_gini.png\n",
-      "GA1 | ID=0 | start=70.533\n",
-      "dwell: 70.53-104.97s\n",
-      "window: 51.73-124.93s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID0_dwell_70-104s_top10_gini.png\n",
-      "GA1 | ID=9 | start=33.937\n",
-      "dwell: 33.94-71.03s\n",
-      "window: 0.00-121.03s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID9_dwell_33-71s_top10_gini.png\n",
-      "GA1 | ID=9 | start=122.939\n",
-      "dwell: 122.94-155.04s\n",
-      "window: 72.94-162.03s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID9_dwell_122-155s_top10_gini.png\n",
-      "GA1 | ID=10 | start=0.665\n",
-      "dwell: 0.67-26.94s\n",
-      "window: 0.00-76.94s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID10_dwell_0-26s_top10_gini.png\n",
-      "GA1 | ID=18 | start=17.796\n",
-      "dwell: 17.80-43.59s\n",
-      "window: 0.00-93.59s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID18_dwell_17-43s_top10_gini.png\n",
-      "GA1 | ID=23 | start=55.060\n",
-      "dwell: 55.06-93.16s\n",
-      "window: 5.06-93.16s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID23_dwell_55-93s_top10_gini.png\n",
-      "GA1 | ID=30 | start=61.049\n",
-      "dwell: 61.05-83.00s\n",
-      "window: 11.05-133.00s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID30_dwell_61-83s_top10_gini.png\n",
-      "GA1 | ID=30 | start=411.062\n",
-      "dwell: 411.06-469.96s\n",
-      "window: 361.06-500.40s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID30_dwell_411-469s_top10_gini.png\n",
-      "GA1 | ID=32 | start=67.532\n",
-      "dwell: 67.53-93.16s\n",
-      "window: 17.53-93.16s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID32_dwell_67-93s_top10_gini.png\n",
-      "GA1 | ID=33 | start=142.564\n",
-      "dwell: 142.56-188.98s\n",
-      "window: 92.56-238.98s\n",
-      "Feature plots saved -> C:\\Users\\Tomoko\\Desktop\\Dwelling_Project\\parquet_pipeline\\exported_models\\feature_plots\\GA1_ID33_dwell_142-188s_top10_gini.png\n"
-     ]
-    }
-   ],
-   "source": [
-    "# CELL 4 - Plots of first n wonderful dwelling events\n",
-    "\n",
-    "import feature_plots as fp\n",
-    "import importlib\n",
-    "importlib.reload(fp)\n",
-    "\n",
-    "ranked_features = pd.read_csv(MODEL_DIR /\"plots\"/\"feature_ranking.txt\", header=None)[0].tolist()\n",
-    "wonderful_dwells = ann_df[(ann_df[\"behavior\"] == \"dwelling\") & (ann_df[\"tags\"].fillna(\"\").str.contains(\"wonderful\", case=False))].sort_values([\"source\", \"ID\", \"t0_sec\"])\n",
-    "plot_features = ranked_features[:10]\n",
-    "\n",
-    "print(f\"Found {len(wonderful_dwells)} wonderful dwellings\")\n",
-    "\n",
-    "# first 20 wonderful by larva ID, only plotting top 10 GINI features in descending order\n",
-    "for _, row in wonderful_dwells.head(20).iterrows():\n",
-    "\n",
-    "    print(\n",
-    "        f\"{row['source']} | \"\n",
-    "        f\"ID={row['ID']} | \"\n",
-    "        f\"start={row['t0_sec']:.3f}\"\n",
-    "    )\n",
-    "\n",
-    "    fp.plot_dwelling_segment(\n",
-    "        ann_df = ann_df,\n",
-    "        traj_df = traj_df,\n",
-    "        feat_prob_by_source = feat_prob_by_source,\n",
-    "        output_dir = OUTPUT_DIR,\n",
-    "        source=row[\"source\"],\n",
-    "        larva_id=row[\"ID\"],\n",
-    "        start_time=row[\"t0_sec\"],\n",
-    "        feature_list=plot_features,\n",
-    "        plot_name=\"top10_gini\",\n",
-    "    )"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "dwelling",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.12.13"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+]
+
+# top 10 features
+plot_features = ranked_features[:10]
+
+ranked_plot_features = [f for f in ranked_features if f in plot_features]
+
+# Plotting selected features in order descending according to GINI feature importance, as calculated during model training
+fp.plot_dwelling_segment(
+    ann_df = ann_df,
+    traj_df = traj_df,
+    feat_prob_by_source = feat_prob_by_source,
+    output_dir = OUTPUT_DIR,
+    source = "GA1",
+    larva_id = 999,
+    start_time = 186.942,
+    feature_list = ranked_plot_features,
+    plot_name = "top_10_gini",
+)
+
+
+# CELL 4 - Plots of first n wonderful dwelling events
+import feature_plots as fp
+import importlib
+importlib.reload(fp)
+
+ranked_features = pd.read_csv(MODEL_DIR /"plots"/"feature_ranking.txt", header=None)[0].tolist()
+wonderful_dwells = ann_df[(ann_df["behavior"] == "dwelling") & (ann_df["tags"].fillna("").str.contains("wonderful", case=False))].sort_values(["source", "ID", "t0_sec"])
+plot_features = ranked_features[:20]
+
+print(f"Found {len(wonderful_dwells)} wonderful dwellings")
+
+# first n wonderful by larva ID, only plotting top 10 GINI features in descending order
+for _, row in wonderful_dwells.head(50).iterrows():
+
+    print(
+        f"{row['source']} | "
+        f"ID={row['ID']} | "
+        f"start={row['t0_sec']:.3f}"
+    )
+
+    fp.plot_dwelling_segment(
+        ann_df = ann_df,
+        traj_df = traj_df,
+        feat_prob_by_source = feat_prob_by_source,
+        output_dir = OUTPUT_DIR,
+        source=row["source"],
+        larva_id=row["ID"],
+        start_time=row["t0_sec"],
+        feature_list=plot_features,
+        plot_name="top20_gini",
+    )
