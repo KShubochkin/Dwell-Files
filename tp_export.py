@@ -40,6 +40,7 @@ from feature_store import FeatureSetConfig, _parquet_path, _KEY_COLS
 from scipy.ndimage import binary_closing, binary_opening, median_filter
 from dataclasses import dataclass
 
+import pyarrow.parquet as pq
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -85,7 +86,6 @@ def plot_gini(names, imp, output_dir, num=None):
 
     order = np.argsort(mean)[::-1][:num]
     ranked_features = list(np.asarray(names)[order])
-
     fig, ax = plt.subplots(figsize=(10, len(order) * 0.35))
     y_pos = np.arange(len(order))
     ax.barh(
@@ -148,6 +148,7 @@ def train(
     train_keys=None,
     do_plot_gini=False,
     plot_path=None,
+    n_est=300,max_dep=16,max_feat=0.3,min_samples=100,min_split=2,
 ):
     """
     Train a RandomForest classifier.
@@ -181,17 +182,16 @@ def train(
 
     # ── Load raw features from cache ──────────────────────────────────────────
     X_list, meta_list = [], []
+    
     for src in prefixes:
-        dest = _parquet_path(cache_dir, src)
-        if not dest.exists():
-            print(f"  WARNING: no cache for '{src}' — skipping")
+        try:
+            # Let feature_store handle fragmented reading and stitching
+            X_src, meta_src = fs._load_features_for_sources(cache_dir, [src], fsc)
+            X_list.append(X_src)
+            meta_list.append(meta_src)
+        except FileNotFoundError:
+            print(f"  WARNING: no cache parquet for '{src}' — skipping.")
             continue
-        df_src = pd.read_parquet(dest)
-        for c in feature_cols:
-            if c not in df_src.columns:
-                df_src[c] = 0.0
-        meta_list.append(df_src[_KEY_COLS])
-        X_list.append(df_src[feature_cols].astype("float32"))
 
     if not X_list:
         raise RuntimeError("No cached features found for any training source.")
@@ -243,15 +243,18 @@ def train(
 
     # ── Fit model ─────────────────────────────────────────────────────────────
     model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=16,
-        max_features=0.3,
-        min_samples_leaf=100,
+        n_estimators=n_est,
+        max_depth=max_dep,
+        max_features=max_feat,
+        min_samples_split=min_split,
+        min_samples_leaf=min_samples,
         random_state=seed,
         n_jobs=-1,
         class_weight="balanced_subsample",
         oob_score=True,
     )
+    
+    
     model.fit(X_train.values, y.values)
     
     if do_plot_gini:
@@ -263,11 +266,6 @@ def train(
         with open(plot_path / "feature_ranking.txt", "w") as f:
             for feat in ranked_features:
                 f.write(feat + "\n")
-
-        # try:
-        #     plot_gini(importance_sum,plot_path,ppc_id)
-        # except:
-        #     print("Provide a plot path.")
     
     
     # ── Persist ───────────────────────────────────────────────────────────────
@@ -297,6 +295,7 @@ def infer(
     cache_dir,
     logic_file,
     fsc: FeatureSetConfig = None,
+    infer_keys=None,
 ):
     """
     Run model inference over `files`.
@@ -353,22 +352,42 @@ def infer(
 
     meta_test_list = []
     log_messages   = []
+    
 
     for file_id in files:
         print(f"\n=== Processing file_id={file_id} ===")
-        dest = _parquet_path(cache_dir, file_id)
-        if not dest.exists():
+        try:
+            # Let feature_store handle the fragmented reading and stitching
+            X_inf, meta = fs._load_features_for_sources(cache_dir, [file_id], fsc)
+        except FileNotFoundError:
             print(f"  WARNING: no cache parquet for '{file_id}' — skipping.")
             continue
-
-        print(f"  Loading features from cache …")
-        df_src = pd.read_parquet(dest)
-        for c in feature_cols:
-            if c not in df_src.columns:
-                df_src[c] = 0.0
-
-        meta = df_src[_KEY_COLS].copy()
-        X_inf = df_src[feature_cols].astype("float32")
+        
+        if infer_keys is not None:
+            ik = infer_keys.copy()
+            ik["source"] = ik["source"].astype(str)
+            ik["ID"]     = ik["ID"].astype(str)
+            
+            meta["source"] = meta["source"].astype(str)
+            meta["ID"]     = meta["ID"].astype(str)
+            
+            # Store the original row index so we know exactly which rows survive
+            meta["_row_idx"] = np.arange(len(meta))
+            
+            # Perform the inner merge on the metadata
+            meta = meta.merge(ik, on=["source", "ID"], how="inner")
+            
+            if meta.empty:
+                print(f"  No validation larvae in {file_id}. Skipping.")
+                continue
+                
+            # Slice X_inf using the specific indices that survived the merge
+            X_inf = X_inf.iloc[meta["_row_idx"]].reset_index(drop=True)
+            
+            # Clean up the temporary tracking column
+            meta = meta.drop(columns=["_row_idx"])
+        
+        
         print(f"  Source: {file_id}  |  Rows: {len(X_inf):,}")
         print(f"  RAM free: {psutil.virtual_memory().available/1e9:.1f} GB")
 
@@ -421,7 +440,7 @@ def infer(
         print(f"  Probabilities appended → {probabilities_path}")
         meta_test_list.append(res.copy())
 
-        del df_src, res, meta, probs
+        del res, meta, probs
         gc.collect()
         print(f"  RAM free after cleanup: {psutil.virtual_memory().available/1e9:.1f} GB")
 
@@ -628,8 +647,9 @@ def assess_performance(
     ppc_id   = ppc.get_IDstr()
     preds_dir = Path(preds_dir)
     val_dir   = Path(val_dir)
-    plot_dir  = Path(plots) / ppc_id
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    if plots is not None:
+        plot_dir  = Path(plots) / ppc_id
+        plot_dir.mkdir(parents=True, exist_ok=True)
 
     pred_path = preds_dir / f"{ppc_id}_predictions.csv"
     results   = pd.read_csv(pred_path).copy()
@@ -866,67 +886,113 @@ def assess_performance(
             "",
         ])
 
-        plt.style.use("seaborn-v0_8-whitegrid")
-
-        fpr_c, tpr_c, _ = roc_curve(gt_eval, probs_eval)
-        fig, ax = plt.subplots(figsize=(6, 6))
-        RocCurveDisplay(fpr=fpr_c, tpr=tpr_c, roc_auc=auroc).plot(ax=ax)
-        ax.set_title(f"ROC Curve - {ppc_id}")
-        fig.savefig(plot_dir / "ROC_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
-
-        prec, rec, _ = precision_recall_curve(gt_eval, probs_eval)
-        fig, ax = plt.subplots(figsize=(6, 6))
-        PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap).plot(ax=ax)
-        ax.set_title(f"Precision-Recall Curve - {ppc_id}")
-        fig.savefig(plot_dir / "PR_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
-
-        prob_true_c, prob_pred_c = calibration_curve(gt_eval, probs_eval)
-        fig, ax = plt.subplots(figsize=(6, 6))
-        CalibrationDisplay(prob_true_c, prob_pred_c, probs_eval).plot(ax=ax)
-        ax.set_title(f"Calibration Curve - {ppc_id}")
-        fig.savefig(plot_dir / "Calibration.png", bbox_inches="tight", dpi=300); plt.close(fig)
-
-        cm = confusion_matrix(gt_eval, preds_eval)
-        fig, ax = plt.subplots(figsize=(7, 6))
-        ConfusionMatrixDisplay(cm).plot(ax=ax, cmap="Blues")
-        ax.grid(False)
-        ax.set_title(f"Confusion Matrix - {ppc_id}")
-        plt.text(0.8, -0.12,
-            f"TPR/Sensitivity = {tpr:.3f}\n"
-            f"TNR/Specificity = {tnr:.3f}\n"
-            f"FPR = {fpr:.3f}",
-            transform=plt.gca().transAxes, ha="left", va="bottom", color = "#000000", fontsize=7, 
-        )
-        fig.savefig(plot_dir / "Confusion_Matrix.png", bbox_inches="tight", dpi=300); plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(6, 6))
-        DetCurveDisplay.from_predictions(gt_eval, probs_eval, ax=ax)
-        ax.set_title(f"DET Curve - {ppc_id}")
-        fig.savefig(plot_dir / "DET_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
-
-        probs_2d = np.vstack([1 - probs_eval, probs_eval]).T
-        fig, ax = plt.subplots(figsize=(7, 6))
-        plot_cumulative_gain(gt_eval, probs_2d, ax=ax)
-        fig.savefig(plot_dir / "Cumulative_Gain.png", bbox_inches="tight", dpi=300); plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(7, 6))
-        plot_lift_curve(gt_eval, probs_2d, ax=ax)
-        fig.savefig(plot_dir / "Lift_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
-        
-        fig, ax = plt.subplots(figsize = (7,6))
         meta_eval = results.loc[eval_mask, ['source', 'ID', 'et']].reset_index(drop=True)
         tp_ev, fp_ev, fn_ev = event_confusion_matrix(gt_eval, preds_eval, meta_eval, overlap_threshold=0.3)
-        cm_events = np.array([[0, fp_ev], 
-                            [fn_ev, tp_ev]])
-        disp_e = ConfusionMatrixDisplay(cm_events,display_labels=["No Event", "Event"])
-        ax.grid(False)
-        disp_e.plot(ax=ax, colorbar=True, cmap="Purples")
-        ax.set_title(f"Event Confusion Matrix - {ppc_id}")
-        fig.savefig(plot_dir / f"Event_Confusion_Matrix.png",bbox_inches="tight",dpi=300)
+        
+        if plots is not None:
+            plt.style.use("seaborn-v0_8-whitegrid")
+
+            fpr_c, tpr_c, _ = roc_curve(gt_eval, probs_eval)
+            fig, ax = plt.subplots(figsize=(6, 6))
+            RocCurveDisplay(fpr=fpr_c, tpr=tpr_c, roc_auc=auroc).plot(ax=ax)
+            ax.set_title(f"ROC Curve - {ppc_id}")
+            fig.savefig(plot_dir / "ROC_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
+
+            prec, rec, _ = precision_recall_curve(gt_eval, probs_eval)
+            fig, ax = plt.subplots(figsize=(6, 6))
+            PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap).plot(ax=ax)
+            ax.set_title(f"Precision-Recall Curve - {ppc_id}")
+            fig.savefig(plot_dir / "PR_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
+
+            prob_true_c, prob_pred_c = calibration_curve(gt_eval, probs_eval)
+            fig, ax = plt.subplots(figsize=(6, 6))
+            CalibrationDisplay(prob_true_c, prob_pred_c, probs_eval).plot(ax=ax)
+            ax.set_title(f"Calibration Curve - {ppc_id}")
+            fig.savefig(plot_dir / "Calibration.png", bbox_inches="tight", dpi=300); plt.close(fig)
+
+            cm = confusion_matrix(gt_eval, preds_eval)
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ConfusionMatrixDisplay(cm).plot(ax=ax, cmap="Blues")
+            ax.grid(False)
+            ax.set_title(f"Confusion Matrix - {ppc_id}")
+            ax.text(0.8, -0.12,
+                f"TPR/Sensitivity = {tpr:.3f}\n"
+                f"TNR/Specificity = {tnr:.3f}\n"
+                f"FPR = {fpr:.3f}",
+                transform=plt.gca().transAxes, ha="left", va="bottom", color = "#000000", fontsize=7, 
+            )
+            fig.savefig(plot_dir / "Confusion_Matrix.png", bbox_inches="tight", dpi=300); plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(6, 6))
+            DetCurveDisplay.from_predictions(gt_eval, probs_eval, ax=ax)
+            ax.set_title(f"DET Curve - {ppc_id}")
+            fig.savefig(plot_dir / "DET_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
+
+            probs_2d = np.vstack([1 - probs_eval, probs_eval]).T
+            fig, ax = plt.subplots(figsize=(7, 6))
+            plot_cumulative_gain(gt_eval, probs_2d, ax=ax)
+            fig.savefig(plot_dir / "Cumulative_Gain.png", bbox_inches="tight", dpi=300); plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(7, 6))
+            plot_lift_curve(gt_eval, probs_2d, ax=ax)
+            fig.savefig(plot_dir / "Lift_Curve.png", bbox_inches="tight", dpi=300); plt.close(fig)
+            
+            fig, ax = plt.subplots(figsize = (7,6))
+            
+            
+            cm_events = np.array([[0, fp_ev], 
+                                [fn_ev, tp_ev]])
+            disp_e = ConfusionMatrixDisplay(cm_events,display_labels=["No Event", "Event"])
+            ax.grid(False)
+            ax.text(0.8, -0.12,
+                f"TPR/Sensitivity = {tpr:.3f}\n"
+                f"TNR/Specificity = {tnr:.3f}\n"
+                f"FPR = {fpr:.3f}",
+                transform=plt.gca().transAxes, ha="left", va="bottom", color = "#000000", fontsize=7, 
+            )
+            disp_e.plot(ax=ax, colorbar=True, cmap="Purples")
+            ax.set_title(f"Event Confusion Matrix - {ppc_id}")
+            fig.savefig(plot_dir / f"Event_Confusion_Matrix.png",bbox_inches="tight",dpi=300)
+            plt.close(fig)
+        
+        
 
     with open(report_path, "a") as f:
         f.write("\n".join(report_lines) + "\n")
-
-    return {"f1": f1,
+    out_metrics = {}
+    
+    if pred_assess:
+        out_metrics.update({
+            "f1": f1,
             "precision": ppv,
-            "recall/sensitivity": tpr}
+            "recall": tpr,
+            "mcc": mcc,
+            "csi": csi,
+            "accuracy": acc,
+            "balanced_accuracy": ba,
+            "specificity": tnr,
+            "npv": npv,
+            "fbeta": fbeta,
+            "cohen_kappa": ck,
+            "informedness": informedness,
+            "markedness": markedness,
+            "dor": dor,
+            "prevalence": prev,
+            "fpr": fpr,
+            "fnr": fnr,
+            "fm_index": fm,
+            "fdr": fdr,
+            "tp_ev": tp_ev, 
+            "fp_ev":fp_ev, 
+            "fn_ev": fn_ev
+        })
+        
+    if prob_assess:
+        out_metrics.update({
+            "auroc": auroc,
+            "average_precision": ap,
+            "brier_score": brier,
+            "ece": ece
+        })
+
+    return out_metrics
