@@ -50,6 +50,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -137,9 +138,11 @@ def _write_manifest(cache_dir: Path, manifest: dict) -> None:
     )
 
 
-def _parquet_path(cache_dir: Path, source: str) -> Path:
+def _parquet_path(cache_dir: Path, source: str, batch: str = "base") -> Path:
     safe = source.replace("/", "_").replace("\\", "_")
-    return cache_dir / f"features_{safe}.parquet"
+    if batch == "base":
+        return cache_dir / f"features_{safe}.parquet"
+    return cache_dir / f"features_{safe}_{batch}.parquet"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,7 +196,7 @@ def build_full_cache(
     all_columns: dict[str, dict] = {}
 
     for src in all_sources:
-        dest = _parquet_path(cache_dir, src)
+        dest = _parquet_path(cache_dir, src,"base")
         if dest.exists() and not force:
             print(f"  [{src}] already cached — skipping (pass force=True to overwrite)")
             # still harvest column list from manifest
@@ -218,12 +221,15 @@ def build_full_cache(
             windows=windows,
         )
 
-        # Attach the key columns so the parquet is self-describing
-        # (sub may have been mutated by calculate — re-align by position)
-        result = sub[_KEY_COLS].reset_index(drop=True).join(
-            X.reset_index(drop=True)
-        )
-        result.to_parquet(dest, index=False)
+        # 1. Optimize the key columns for instant Parquet serialization
+        keys_df = sub[_KEY_COLS].reset_index(drop=True)
+        keys_df["source"] = keys_df["source"].astype("category")
+        keys_df["ID"] = keys_df["ID"].astype("category")
+        keys_df["et"] = keys_df["et"].astype("float32")
+
+        # 2. Concat and stream to disk in chunks
+        result = pd.concat([keys_df, X.reset_index(drop=True)], axis=1)
+        result.to_parquet(dest, index=False, engine="pyarrow", row_group_size=250000)
         print(f"  [{src}] → {dest.name}  ({len(result):,} rows, {len(X.columns)} features)")
 
         for col in X.columns:
@@ -231,6 +237,7 @@ def build_full_cache(
                 all_columns[col] = {
                     "version": 1,
                     "added_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "batch": "base"
                 }
 
         del sub, X, result
@@ -302,36 +309,30 @@ def update_cache(
     importlib.reload(feature_calc)
 
     all_sources = sources or ctx.long_df["source"].unique().tolist()
-    known_cols = set(manifest["columns"].keys())
+    existing_cols = set(manifest.get("columns", {}).keys())
     version_bump = version_bump or {}
 
     print(f"[feature_store] Updating cache for {len(all_sources)} sources …")
 
+    batch_name = f"batch_{int(time.time())}"
+    global_cols_written = set()
+    
     for src in all_sources:
-        dest = _parquet_path(cache_dir, src)
-        if not dest.exists():
-            print(f"  [{src}] no parquet found — run build_full_cache() first, skipping.")
+        dest_base = _parquet_path(cache_dir, src, "base")
+        if not dest_base.exists():
+            print(f"  [{src}] no base parquet found — run build_full_cache() first, skipping.")
             continue
-
-        existing = pd.read_parquet(dest)
-        existing_cols = set(existing.columns) - set(_KEY_COLS)
 
         sub = ctx.long_df[ctx.long_df["source"] == src].copy().reset_index(drop=True)
         if sub.empty:
             continue
 
-        # ── Determine which columns to (re)compute ────────────────────────────
         if new_columns is None:
-            # Auto-detect mode: full calculate() to discover what's missing.
-            # This is intentionally expensive — it's for "find everything new"
-            # not for targeted updates.  Use explicit new_columns= to avoid it.
             X_calc = feature_calc.calculate(
-                df=sub.copy(),
-                fps=fps,
-                pause_threshold=feature_calc.CONFIG["pause_threshold"],
+                df=sub.copy(), fps=fps, pause_threshold=feature_calc.CONFIG["pause_threshold"]
             )
             cols_to_add  = [c for c in X_calc.columns if c not in existing_cols]
-            cols_to_bump = [c for c in version_bump   if c in X_calc.columns]
+            cols_to_bump = [c for c in version_bump if c in X_calc.columns]
             cols_needed  = list(set(cols_to_add) | set(cols_to_bump))
 
             if not cols_needed:
@@ -343,11 +344,7 @@ def update_cache(
             new_data = X_calc[cols_needed].reset_index(drop=True)
             del X_calc
         else:
-            # Explicit mode: only compute exactly the columns requested
-            # (plus any version-bumped ones), skipping those already present.
-            # Uses calculate_columns() — runs only the needed windows/features,
-            # not the full feature matrix.
-            cols_to_add  = [c for c in new_columns  if c not in existing_cols]
+            cols_to_add  = [c for c in new_columns if c not in existing_cols]
             cols_to_bump = [c for c in version_bump if c in existing_cols]
             cols_needed  = list(set(cols_to_add) | set(cols_to_bump))
 
@@ -357,41 +354,53 @@ def update_cache(
                 gc.collect()
                 continue
 
-            print(f"  [{src}] targeted compute for {len(cols_needed)} column(s): {cols_needed}")
+            print(f"  [{src}] targeted compute for {len(cols_needed)} column(s)")
             X_calc = feature_calc.calculate_columns(
-                df=sub.copy(),
-                fps=fps,
-                pause_threshold=feature_calc.CONFIG["pause_threshold"],
-                columns=cols_needed,
+                df=sub.copy(), fps=fps, pause_threshold=feature_calc.CONFIG["pause_threshold"], columns=cols_needed
             )
             cols_needed = [c for c in cols_needed if c in X_calc.columns]
             new_data = X_calc[cols_needed].reset_index(drop=True)
             del X_calc
 
         # ── Merge into existing parquet ───────────────────────────────────────
-        for col in cols_needed:
-            if col in new_data.columns:
-                existing[col] = new_data[col].values
+        valid_new_cols = [c for c in cols_needed if c in new_data.columns]
 
-        existing.to_parquet(dest, index=False)
-        print(f"  [{src}] added/updated {len(cols_needed)} columns: {cols_needed}")
+        # ── Write entirely independent fragment (No monolithic merging!) ──
+        if valid_new_cols:
+            dest = _parquet_path(cache_dir, src, batch_name)
+            
+            # 1. Optimize the key columns for instant Parquet serialization
+            keys_df = sub[_KEY_COLS].reset_index(drop=True)
+            keys_df["source"] = keys_df["source"].astype("category")
+            keys_df["ID"] = keys_df["ID"].astype("category")
+            keys_df["et"] = keys_df["et"].astype("float32")
+            
+            to_add = new_data[valid_new_cols].reset_index(drop=True)
+            out_df = pd.concat([keys_df, to_add], axis=1)
+            
+            # 2. Stream to disk in chunks
+            out_df.to_parquet(dest, index=False, engine="pyarrow", row_group_size=250000)
+            
+            print(f"  [{src}] saved {len(valid_new_cols)} columns to fragment {batch_name}")
+            global_cols_written.update(valid_new_cols)
 
-        # ── Update manifest column registry ───────────────────────────────────
-        now = time.strftime("%Y-%m-%dT%H:%M:%S")
-        for col in cols_needed:
-            if col in version_bump:
-                manifest["columns"][col] = {
-                    "version": version_bump[col],
-                    "added_at": now,
-                }
-            elif col not in manifest["columns"]:
-                manifest["columns"][col] = {"version": 1, "added_at": now}
-
-        del sub, existing, new_data
+        del sub, new_data
         gc.collect()
+        
+    if global_cols_written:
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        for col in global_cols_written:
+            entry = manifest["columns"].get(col, {"version": 1})
+            if col in version_bump:
+                entry["version"] = version_bump[col]
+            entry["added_at"] = now
+            entry["batch"] = batch_name
+            manifest["columns"][col] = entry
 
-    _write_manifest(cache_dir, manifest)
-    print("[feature_store] Update complete.")
+        _write_manifest(cache_dir, manifest)
+        print(f"[feature_store] Update complete. Manifest updated with {batch_name}.")
+    else:
+        print("[feature_store] Update complete. No new data needed to be written.")
 
 
 def list_cached_features(cache_dir: Path | str) -> pd.DataFrame:
@@ -416,6 +425,7 @@ def list_cached_features(cache_dir: Path | str) -> pd.DataFrame:
             "version": meta.get("version", 1),
             "added_at": meta.get("added_at", "unknown"),
             "window_size": windows,
+            "batch": meta.get("batch", "base")
         })
     df = pd.DataFrame(rows).sort_values(["feature_name"])
     return df
@@ -432,16 +442,15 @@ def load_source_features(
     Always returns key columns (source, ID, et) + requested feature columns.
     """
     cache_dir = Path(cache_dir)
-    dest = _parquet_path(cache_dir, source)
-    if not dest.exists():
-        raise FileNotFoundError(
-            f"No cached features for source '{source}' at {dest}.  "
-            "Run build_full_cache() first."
-        )
-    if columns is not None:
-        load_cols = list(set(_KEY_COLS) | set(columns))
-        return pd.read_parquet(dest, columns=load_cols)
-    return pd.read_parquet(dest)
+    manifest = _read_manifest(cache_dir)
+
+    if columns is None:
+        columns = list(manifest.get("columns", {}).keys())
+
+    # create a dummy fsc to re-use our highly optimized fragment reader
+    fsc = FeatureSetConfig(name="manual_load", base_features=columns, windowed_features={})
+    X, meta = _load_features_for_sources(cache_dir, [source], fsc)
+    return pd.concat([meta, X], axis=1)
 
 
 def check_stale_columns(cache_dir: Path | str, logic_file: str) -> List[str]:
@@ -686,32 +695,80 @@ def _load_features_for_sources(
     fsc: "FeatureSetConfig",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load and concatenate cached features for a list of sources.
-
-    Returns
-    -------
-    X    : float32 DataFrame with only fsc.get_all_columns()
-    meta : DataFrame with (source, ID, et) — same row order as X
+    Lightning-fast fragmented reader using pyarrow selective loads.
+    No merging required.
     """
+    cache_dir = Path(cache_dir)
+    manifest = _read_manifest(cache_dir)
     feature_cols = fsc.get_all_columns()
 
+    # Map requested columns to their specific batch fragment
+    batch_to_cols = {}
+    for c in feature_cols:
+        # Default to base if not found (legacy fallback)
+        batch = manifest.get("columns", {}).get(c, {}).get("batch", "base")
+        batch_to_cols.setdefault(batch, []).append(c)
+
     X_list, meta_list = [], []
+
     for src in sources:
-        dest = _parquet_path(cache_dir, src)
-        if not dest.exists():
-            raise FileNotFoundError(
-                f"No cache parquet for source '{src}'.  "
-                "Run build_full_cache() or update_cache() first."
-            )
-        # Single read — load everything, then select columns
-        df = pd.read_parquet(dest)
-        # Fill any requested feature columns not present in this parquet with 0
-        for c in feature_cols:
-            if c not in df.columns:
-                df[c] = 0.0
-        meta_list.append(df[_KEY_COLS])
-        X_list.append(df[feature_cols].astype("float32"))
+        base_dest = _parquet_path(cache_dir, src, "base")
+        if not base_dest.exists():
+            raise FileNotFoundError(f"Missing base parquet for {src} at {base_dest}")
+
+        # 1. Always load the base file first to extract the meta keys
+        base_req_cols = batch_to_cols.get("base", [])
+        base_schema = set(pq.read_schema(base_dest).names)
+        base_read_cols = _KEY_COLS + [c for c in base_req_cols if c in base_schema]
+
+        base_df = pd.read_parquet(base_dest, columns=base_read_cols)
+        meta_df = base_df[_KEY_COLS]
+        
+        src_dfs = []
+
+        # Fill any requested base columns that were somehow missing
+        for c in base_req_cols:
+            if c not in base_df.columns:
+                base_df[c] = 0.0
+        
+        if base_req_cols:
+            src_dfs.append(base_df[base_req_cols])
+
+        # 2. Iterate through all appended fragments
+        for batch, cols in batch_to_cols.items():
+            if batch == "base": 
+                continue
+            
+            dest = _parquet_path(cache_dir, src, batch)
+            if not dest.exists():
+                batch_df = pd.DataFrame({c: 0.0 for c in cols}, index=base_df.index)
+            else:
+                batch_schema = set(pq.read_schema(dest).names)
+                # Selective read: bypass _KEY_COLS to avoid name collision during horizontal concat
+                read_cols = [c for c in cols if c in batch_schema]
+                batch_df = pd.read_parquet(dest, columns=read_cols)
+                
+                for c in cols:
+                    if c not in batch_df.columns:
+                        batch_df[c] = 0.0
+
+            src_dfs.append(batch_df[cols])
+
+        # 3. Smash them all together horizontally in memory instantly
+        if src_dfs:
+            X_src = pd.concat(src_dfs, axis=1)
+        else:
+            X_src = pd.DataFrame(index=base_df.index)
+
+        X_list.append(X_src)
+        meta_list.append(meta_df)
+
+    if not X_list:
+        raise RuntimeError("No cached features found for any training source.")
 
     meta = pd.concat(meta_list, ignore_index=True)
     X = pd.concat(X_list, ignore_index=True)
+
+    # Reorder X to match the exact order requested by the FeatureSetConfig
+    X = X[feature_cols].astype("float32")
     return X, meta
