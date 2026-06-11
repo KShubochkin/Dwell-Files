@@ -36,8 +36,8 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     ]
     max_time = larva_traj["et"].max()
 
-    PRE_WINDOW = 50
-    POST_WINDOW = 50
+    PRE_WINDOW = 35
+    POST_WINDOW = 35
 
     window_start = max(dwell_start - PRE_WINDOW, 0)
     window_end = min(dwell_end + POST_WINDOW, max_time)
@@ -86,9 +86,9 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
 
     # --- Create figure ---
     n_features = len(feature_list)
-    fig_height = 6 + 2.5 * n_features
+    fig_height = 8 + 2.5 * n_features
     height_ratios = [2.4, 1] + [1] * n_features
-    fig, axes = plt.subplots(n_features + 2, 1, figsize=(10, fig_height), gridspec_kw={"height_ratios": height_ratios})
+    fig, axes = plt.subplots(n_features + 2, 1, figsize=(8, fig_height), gridspec_kw={"height_ratios": height_ratios})
 
     ax_traj = axes[0]
     ax_prob = axes[1]
@@ -110,17 +110,52 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
 
     ax_traj.set_xlabel("x (mm)")
     ax_traj.set_ylabel("y (mm)")
-
-    # plot trajectories
+    
+    # --- plot trajectories ---
     ax_traj.plot(traj_seg["x"], traj_seg["y"], color="purple", linewidth=2, zorder=1)
     ax_traj.plot(dwell["x"], dwell["y"], color="green", linewidth=3, zorder=2)
 
-    # dots for start and end
-    ax_traj.scatter(traj_seg.iloc[0]["x"], traj_seg.iloc[0]["y"], color="orange", s=120, zorder=10)
-    ax_traj.scatter(traj_seg.iloc[-1]["x"], traj_seg.iloc[-1]["y"], color="darkturquoise", s=120, zorder=10)
+    # set axes range
+    fx = traj_seg["x"].values
+    fy = traj_seg["y"].values
 
-    # label time points
-    TIME_MARKER_STEP = 5
+    x_range = fx.max() - fx.min()
+    y_range = fy.max() - fy.min()
+
+    pad_x = max(1, x_range * 0.05)
+    pad_y = max(1, y_range * 0.1)
+
+    ax_traj.set_xlim(fx.min() - pad_x, fx.max() + pad_x)
+    ax_traj.set_ylim(fy.min() - pad_y, fy.max() + pad_y)
+
+    ax_traj.set_aspect("equal", adjustable="datalim")
+    ax_traj.set_box_aspect(0.65)
+
+    # --- larva length bar ---
+    # calculated as median of sum of spine distances across all frames in this larva's trajectory
+    spine_x = larva_traj[[f"xspine_{i}" for i in range(11)]].values
+    spine_y = larva_traj[[f"yspine_{i}" for i in range(11)]].values
+
+    segment_lengths = np.sqrt(np.diff(spine_x, axis=1)**2 +np.diff(spine_y, axis=1)**2)
+    frame_lengths = segment_lengths.sum(axis=1)
+    larva_length = np.median(frame_lengths)
+
+    x_min, x_max = ax_traj.get_xlim()
+    y_min, y_max = ax_traj.get_ylim()
+    bar_x = x_max - larva_length - 0.01 * (x_max - x_min)
+    bar_y = y_min + 0.06 * (y_max - y_min)
+
+    ax_traj.plot([bar_x, bar_x + larva_length], [bar_y, bar_y], color="gray", linewidth=4)
+    ax_traj.text(bar_x + larva_length/2, bar_y - 0.02*(y_max-y_min), f"larva: {larva_length:.2f} mm", ha="center", va="top", fontsize=9, bbox=dict(facecolor="white", alpha=0.7, pad = 0.1, edgecolor="none"))
+
+    # --- dots for start and end ---
+    ax_traj.scatter(traj_seg.iloc[0]["x"], traj_seg.iloc[0]["y"], color="orange", s=100, zorder=10)
+    ax_traj.scatter(traj_seg.iloc[-1]["x"], traj_seg.iloc[-1]["y"], color="darkturquoise", s=100, zorder=10)
+
+    # --- label time points ---
+    window_duration = window_end - window_start
+    TARGET_MARKERS = 12
+    TIME_MARKER_STEP = max(1, round(window_duration/TARGET_MARKERS))
     times = np.arange(
         np.ceil(window_start / TIME_MARKER_STEP) * TIME_MARKER_STEP,
         window_end,
@@ -134,22 +169,6 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
         time_txt.set_path_effects([pe.Stroke(linewidth=3.5, foreground="white", alpha=0.5), pe.Normal()])
         ax_traj.plot(row["x"], row["y"], "o", ms=4, mfc="none", mec="black", zorder=6)
 
-    # larva length bar: calculated as median of sum of spine distances across all frames in this larva's trajectory
-    spine_x = larva_traj[[f"xspine_{i}" for i in range(11)]].values
-    spine_y = larva_traj[[f"yspine_{i}" for i in range(11)]].values
-
-    segment_lengths = np.sqrt(np.diff(spine_x, axis=1)**2 +np.diff(spine_y, axis=1)**2)
-    frame_lengths = segment_lengths.sum(axis=1)
-    larva_length = np.median(frame_lengths)
-
-    x_min, x_max = ax_traj.get_xlim()
-    y_min, y_max = ax_traj.get_ylim()
-    bar_x = x_min + 0.85 * (x_max - x_min)
-    bar_y = y_min + 0.08 * (y_max - y_min)
-
-    ax_traj.plot([bar_x, bar_x + larva_length], [bar_y, bar_y], color="gray", linewidth=4)
-    ax_traj.text(bar_x + larva_length/2, bar_y - 0.02*(y_max-y_min), f"larva length: {larva_length:.2f} mm", ha="center", va="top", fontsize=9, bbox=dict(facecolor="white", alpha=0.7, pad = 0.1, edgecolor="none"))
-
     # legend
     legend_traj = [
         Line2D([0], [0], color="green", linewidth=3, label="GT Dwelling"),
@@ -159,7 +178,6 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     ]
     ax_traj.legend(handles=legend_traj, fontsize=8, framealpha=0.9)
 
-    
     # ==================================================
     # PROBABILITY PANEL
     # ==================================================
@@ -177,22 +195,23 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     ax_prob.set_xlabel("Time (s)")
     ax_prob.set_ylabel("Probability")
 
-    ax_prob.plot(plot_seg["et"], plot_seg["prob"].values, linewidth=2, label = "Predicted probability")
-    ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2)
+    ax_prob.plot(plot_seg["et"], plot_seg["prob"].values, linewidth=2, label ="Predicted probability")
     ax_prob.step(plot_seg["et"], plot_seg["pred_binary"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label="Binary prediction (Threshold=0.6)")
+    ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2, label="GT Dwelling")
 
-    legend_prob = ax_prob.legend(fontsize=8, framealpha=0.5)
+    ax_prob.legend(fontsize=8, framealpha=0.5)
 
     # ==================================================
     # FEATURE PANELS
     # ==================================================
 
     for ax, feature in zip(ax_feat, feature_list):
-        ax.plot(plot_seg["et"], plot_seg[feature], linewidth=2)
-        ax.axvspan(dwell_start, dwell_end, alpha=0.2)
+        ax.plot(plot_seg["et"], plot_seg[feature], linewidth=2, color="#CB5141")
+        ax.axvspan(dwell_start, dwell_end, alpha=0.2, color="#d9a783", label="GT Dwelling")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(feature)
         ax_feat[-1].set_xlabel("Time (s)")
+        ax.legend(fontsize=8, framealpha=0.5)
 
     
     plt.tight_layout()
