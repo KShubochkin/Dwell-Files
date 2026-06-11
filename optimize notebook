@@ -1,0 +1,323 @@
+CELL 1 - SETUP
+import importlib
+import random
+import os
+import gc
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import feature_store as fs
+importlib.reload(fs)
+import tp_export as tp
+from tp_export import PostProcessConfig
+import split_dataset as sd
+from pp import get_context, validate_context
+
+TRAIN_DATA   = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks\parquet_pipeline\annotations_split\train")
+ANN_MASTER   = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\annotation\annotation.csv")
+BASE_OUT_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\exported_models")
+FOLDS_DIR= Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks\parquet_pipeline\annotations_split\three_folds")
+MASTER_CACHE_DIR = BASE_OUT_DIR / "master_feature_cache"
+LOGIC_FILE = "feature_registry"
+FPS        = 6.0
+
+f1 = {}
+f2 = {}
+f3 = {}
+
+f1["pd"] = pd.read_csv(FOLDS_DIR / "fold_one" / "annotations_validation.csv")
+f2["pd"] = pd.read_csv(FOLDS_DIR / "fold_two" / "annotations_train.csv")
+f3["pd"] = pd.read_csv(FOLDS_DIR / "fold_three" / "annotations_validation.csv")
+
+f1["train_ann"] = pd.merge(f2["pd"],f3["pd"],how="outer")
+f2["train_ann"] =  pd.merge(f1["pd"],f3["pd"],how="outer")
+f3["train_ann"] = pd.merge(f1["pd"],f2["pd"],how="outer")
+f1["val_ann"]   = f1["pd"]
+f2["val_ann"] = f2["pd"]
+f3["val_ann"] = f3["pd"]
+f1["VAL_DIR"] = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks\parquet_pipeline\annotations_split\three_folds\fold_one")
+f2["VAL_DIR"] = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks\parquet_pipeline\annotations_split\three_folds\fold_two")
+f3["VAL_DIR"] = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks\parquet_pipeline\annotations_split\three_folds\fold_three")
+
+
+for f in [f1,f2,f3]:
+    f["TRAIN_PREFIXES"] = f["train_ann"]["source"].unique().tolist()
+    f["TEST_FILES"]     = f["val_ann"]["source"].unique().tolist()
+    f["sources"]        = list(set(f["TRAIN_PREFIXES"]).union(set(f["TEST_FILES"])))
+
+    f["TRAIN_SLICES"] = {src: slice(None) for src in f["TRAIN_PREFIXES"]}
+    f["train_keys"]   = f["train_ann"][["source", "ID"]].drop_duplicates()
+    f["val_keys"]     = f["val_ann"][["source", "ID"]].drop_duplicates()
+
+
+all_ann_keys = pd.merge(f1["train_keys"],f1["val_keys"],how="outer")
+
+ctx = get_context(
+    parquet_path = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\raw_trajectories.parquet"),
+    ann_csv      = ANN_MASTER,
+    session_dir  = TRAIN_DATA,  
+    sources      = f1["sources"],
+)
+clean_full_annotations = ctx.annotated.copy()
+
+#CELL 2 - INSTRUCTIONS FOR OPTIMIZER
+import optuna
+import os
+import shutil
+from pathlib import Path
+importlib.reload(fs)
+from feature_store import FeatureSetConfig
+from tp_export import PostProcessConfig
+import tp_export as tp
+import tempfile
+import statistics
+
+def objective(trial):
+    # ==========================================
+    # DOMAIN A: Feature Selection
+    # ==========================================
+    
+    standard_wins = [5,7,10,11,13,15,17,18,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,120]
+    
+    available_features = {
+        "omega_body_mean": standard_wins,
+        "omega_head_std": standard_wins,
+        "omega_relative_mean": standard_wins,
+        "rog": standard_wins,
+        "tortuosity": standard_wins,
+        "msd": standard_wins,
+        "bending_std": standard_wins,
+        "hc_ratio_mean": standard_wins,
+        "ht_ratio_mean": standard_wins,
+        "omega_body_mean_slope_smooth": standard_wins,
+        "vel_mean": standard_wins,
+        "vel_std": standard_wins,
+        "vel_norm_mean": standard_wins,
+        "head_vel_mean": standard_wins,
+        "head_vel_std": standard_wins,
+        "omega_heading_mean": standard_wins,
+        "coverage": standard_wins,
+        "bend_peaks_rate": standard_wins,
+        "pause_run_frac": standard_wins,
+        "reversal_rate": standard_wins,
+        "angular_tortuosity": standard_wins,
+        "revisitation_mean": standard_wins,
+        "revis_slope_smooth": standard_wins,
+        "rog_slope_smooth": standard_wins,
+        "tort_slope_smooth": standard_wins,
+        # Restricted features
+        "vel_lag": [50, 75],
+        "vel_lead": [50, 75],
+        "bend_freq_rolling": [75]
+    }
+    dynamic_windowed_features = {}
+    MAX_WINDOWS_PER_FEATURE = 4
+
+    for feat_name, valid_wins in available_features.items():
+        
+        max_possible = min(MAX_WINDOWS_PER_FEATURE, len(valid_wins))
+        n_windows = trial.suggest_int(f"n_wins_{feat_name}", 0, max_possible)
+
+        if n_windows == 0:
+            continue 
+
+        selected_wins = []
+        current_min_idx = 0
+        
+        for i in range(n_windows):
+            max_idx = len(valid_wins) - 1 - (n_windows - 1 - i)
+        
+            win_idx = trial.suggest_int(f"idx_{feat_name}_w{i}", current_min_idx, max_idx)
+            selected_wins.append(valid_wins[win_idx])
+            
+            current_min_idx = win_idx + 1 
+
+        dynamic_windowed_features[feat_name] = selected_wins
+
+    dynamic_base_features = []
+    if trial.suggest_categorical("use_larva_body_length", [True, False]):
+        dynamic_base_features.append("larva_body_length")
+
+    if not dynamic_base_features and not dynamic_windowed_features:
+        raise optuna.exceptions.TrialPruned()
+
+    fsc = FeatureSetConfig(
+        name=f"optuna_trial_{trial.number}",
+        description="Granular Per-Feature-Window Search",
+        base_features=dynamic_base_features,
+        windowed_features=dynamic_windowed_features
+    )
+    # ==========================================
+    # DOMAIN B: Tree Hyperparameters
+    # ==========================================
+        
+    min_leaf = trial.suggest_float("min_leaf", 0.0005, 0.05)
+    split_multiplier = trial.suggest_float("split_multiplier", 2.0, 10.0)
+
+    rf_params = {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 300, step=50),
+        "max_depth": trial.suggest_int("max_depth", 5, 45),
+        "min_leaf": min_leaf,
+        "min_split": min_leaf * split_multiplier,
+    }
+    rf_params["max_feat"] = trial.suggest_categorical(
+        "max_feat", 
+        ['sqrt', 'log2', 0.2, 0.3, 0.4, 0.5]
+)
+    # ==========================================
+    # DOMAIN C: Post-Processing Parameters
+    # ==========================================
+    MF = trial.suggest_int("MF", 1, 17, step=2)      # Median Filter (odd numbers)
+    TH = trial.suggest_float("TH", 0.4, 0.8)        # Threshold
+    GC = trial.suggest_int("GC", 1, 15,step=2)              # Gap Close
+    GO = trial.suggest_int("GO", 1, 25,step=2)             # Gap Open
+    
+    ppc = PostProcessConfig(MF, TH, GC, GO)
+
+    # ==========================================
+    # EXECUTION: Train -> Infer -> Predict -> Assess
+    # ==========================================
+    # Create an isolated output directory so trials don't overwrite each other
+    for fold in [f1,f2,f3]:
+    
+        TRAIN_SLICES = fold["TRAIN_SLICES"]
+        TRAIN_PREFIXES = fold["TRAIN_PREFIXES"]
+        TEST_FILES = fold["TEST_FILES"]
+        train_keys = fold["train_keys"]
+        val_keys = fold["val_keys"]
+        VAL_DIR = fold["VAL_DIR"]
+        sources        = list(set(TRAIN_PREFIXES).union(set(TEST_FILES)))
+        
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_out_dir = Path(temp_dir)
+            
+            model_path = temp_out_dir / "final_model.pkl"
+            probabilities_path = temp_out_dir / "probabilities.csv"
+            preds_dir = temp_out_dir / "preds"
+            os.makedirs(preds_dir, exist_ok=True)
+            
+            prefixes = list(TRAIN_SLICES.keys())
+            trial_seed = globals().get('SEED', globals().get('seed', 42))
+            
+            # 1. Train
+            tp.train(
+                ctx=ctx, slices=TRAIN_SLICES, prefixes=prefixes, logic_file=LOGIC_FILE,
+                model_path=model_path, feature_path=temp_out_dir / "fsc.pkl",
+                metadata_path=temp_out_dir / "meta.pkl", seed=trial_seed,
+                cache_dir=MASTER_CACHE_DIR, fsc=fsc, train_keys=train_keys, 
+                do_plot_gini=False, plot_path=temp_out_dir,
+                n_est=rf_params['n_estimators'], max_dep=rf_params['max_depth'],
+                min_split=rf_params['min_split'], min_samples=rf_params['min_leaf'],
+                max_feat=rf_params['max_feat'],
+            )
+            
+            # 2. Infer
+            tp.infer(
+                model_path=model_path, ctx=ctx, files=TEST_FILES,
+                feature_path=temp_out_dir / "fsc.pkl", probabilities_path=probabilities_path,
+                metadata_test_path=temp_out_dir / "meta_test.pkl",
+                cache_dir=MASTER_CACHE_DIR, logic_file=LOGIC_FILE, fsc=fsc,
+                infer_keys=val_keys
+            )
+            
+            # 3. Predict (Post-process)
+            tp.predict(
+                probabilities_path=probabilities_path, ppc=ppc,
+                predictions_dir=preds_dir, ctx=ctx,
+                logic_file=LOGIC_FILE, plot=False
+            )
+            
+            # 4. Assess
+            fold["metrics"] = tp.assess_performance(
+                preds_dir=preds_dir, val_dir=VAL_DIR,
+                ppc=ppc, prefixes=TRAIN_PREFIXES, sources=sources,
+                report_path=temp_out_dir / "log.txt", plots=None,
+                dwell_tags=["wonderful"], rf_assess=True,
+                val_keys=val_keys, train_keys=train_keys
+            )
+            
+            
+    
+    # Store auxiliary metrics in Optuna dashboard
+    for metric_name, value in f1["metrics"].items():
+        if isinstance(value, (int, float)): 
+            val = statistics.mean([value,f2["metrics"][metric_name],f3["metrics"][metric_name]])
+            trial.set_user_attr(metric_name, val)
+            
+    
+    return statistics.mean([f1["metrics"]["f1"], f2["metrics"]["f1"], f3["metrics"]["f1"]])
+
+#CELL 3 - INITIATE STUDY - you can run this every time safely
+# 1 edge case - if you run the next cell and it bugs on the FIRST trial, youll need to update the study_name to the next version up and rerun it
+import optuna
+from optuna.samplers import TPESampler
+
+# 1. Name your study and create a local database file
+study_name = "dwelling_mini_search_v1"
+storage_name = f"sqlite:///{study_name}.db"
+
+
+#random_sampler = optuna.samplers.RandomSampler()
+
+study = optuna.create_study(
+    study_name=study_name,
+    storage=storage_name,
+    direction="maximize",
+    load_if_exists=True,
+    sampler=TPESampler(n_startup_trials=250) # <- HERE INPUT HOW MANY RANDOM SAMPLES U WANT IT TO START WITH
+    #sampler = random_sampler
+#USE ABOVE LINE IF U WANT RANDOM SAMPLER
+)
+study.set_user_attr("name",study_name)
+study_dir  = Path(BASE_OUT_DIR / "optuna" / study_name)
+study_dir.mkdir(parents=True, exist_ok=True)
+
+# CELL 4 - run optimizer!!! feel free to quit, interrupt, rerun this cell as you like, itll save all completed trials.
+importlib.reload(tp)
+import os
+import warnings
+warnings.filterwarnings(
+    "ignore", 
+    message="`sklearn.utils.parallel.delayed` should be used with"
+)
+os.environ["PYTHONWARNINGS"] = (
+    "ignore::UserWarning:sklearn.utils.parallel"
+)
+
+ann = ctx.annotated[["source", "ID", "et", "behavior", "tags"]].copy()
+ann["source"] = ann["source"].astype(str)
+ann["ID"]     = ann["ID"].astype(str)
+ann["et"]     = ann["et"].astype("float32").round(4)
+
+if all_ann_keys is not None:
+    print("[train] Pre-filtering annotation table to annotated train larvae …")
+    ann_keys = all_ann_keys.copy()
+    ann_keys["source"] = ann_keys["source"].astype(str)
+    ann_keys["ID"]     = ann_keys["ID"].astype(str)
+    n_ann_before = len(ann)
+    ann = ann.merge(ann_keys, on=["source", "ID"], how="inner")
+    print(f"[train] Annotations restricted: {n_ann_before} → {len(ann)} rows "
+            f"({ann[['source','ID']].drop_duplicates().shape[0]} larvae)")
+
+ctx.annotated = ann
+    
+# 3. Run the optimization.
+# Instead of n_trials, you can use 'timeout' (in seconds). 
+# For example, let it run for exactly 12 hours (60 * 60 * 12)
+print(f"Starting Mega-Search. Current best F1: {study.best_value if len(study.trials) > 0 else 'None'}")
+
+try:
+    study.optimize(objective, timeout=36000) # other ways to run -> #n_trials=1), #timeout=43200) # 12 hours
+except KeyboardInterrupt:
+    print("\nSearch paused safely by user.")
+
+print("\n=== ABSOLUTE OPTIMUM FOUND ===")
+print(f"Best F1 Score: {study.best_value}")
+print("Best Parameters:")
+for key, value in study.best_params.items():
+    print(f"  {key}: {value}")
