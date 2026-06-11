@@ -149,8 +149,8 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     ax_traj.text(bar_x + larva_length/2, bar_y - 0.02*(y_max-y_min), f"larva: {larva_length:.2f} mm", ha="center", va="top", fontsize=9, bbox=dict(facecolor="white", alpha=0.7, pad = 0.1, edgecolor="none"))
 
     # --- dots for start and end ---
-    ax_traj.scatter(traj_seg.iloc[0]["x"], traj_seg.iloc[0]["y"], color="orange", s=100, zorder=10)
-    ax_traj.scatter(traj_seg.iloc[-1]["x"], traj_seg.iloc[-1]["y"], color="darkturquoise", s=100, zorder=10)
+    ax_traj.scatter(traj_seg.iloc[0]["x"], traj_seg.iloc[0]["y"], color="darkturquoise", s=100, zorder=10)
+    ax_traj.scatter(traj_seg.iloc[-1]["x"], traj_seg.iloc[-1]["y"], color="orange", s=100, zorder=10)
 
     # --- label time points ---
     window_duration = window_end - window_start
@@ -173,8 +173,8 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     legend_traj = [
         Line2D([0], [0], color="green", linewidth=3, label="GT Dwelling"),
         Line2D( [0], [0], color="purple", linewidth=2,label="Non-dwelling"),
-        Line2D([0], [0],  marker="o", color="orange", linestyle="None", markersize=8, label="Window start"),
-        Line2D([0], [0], marker="o", color="darkturquoise", linestyle="None", markersize=8, label="Window end")
+        Line2D([0], [0],  marker="o", color="darkturquoise", linestyle="None", markersize=8, label="Window start"),
+        Line2D([0], [0], marker="o", color="orange", linestyle="None", markersize=8, label="Window end")
     ]
     ax_traj.legend(handles=legend_traj, fontsize=8, framealpha=0.9)
 
