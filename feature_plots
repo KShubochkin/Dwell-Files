@@ -22,7 +22,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
         (ann_df["source"] == source) &
         (ann_df["ID"] == larva_id) &
         (ann_df["behavior"] == "dwelling") &
-        (abs(ann_df["t0_sec"] - start_time) < 0.01)
+        (abs(ann_df["t0_sec"] - start_time) < 1)
     ].iloc[0]
 
     # --- Determine plotting window ---
@@ -77,6 +77,8 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
         (traj_seg["et"] <= dwell_end)
     )
 
+    traj_seg = traj_seg.sort_values("et").reset_index(drop=True)
+
     plot_seg = feat_prob_df[
         (feat_prob_df["source"] == source) &
         (feat_prob_df["ID"] == larva_id) &
@@ -124,9 +126,6 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
 
     pad_x = max(1, x_range * 0.05)
     pad_y = max(1, y_range * 0.1)
-
-    ax_traj.set_xlim(fx.min() - pad_x, fx.max() + pad_x)
-    ax_traj.set_ylim(fy.min() - pad_y, fy.max() + pad_y)
 
     ax_traj.set_aspect("equal", adjustable="datalim")
     ax_traj.set_box_aspect(0.65)
@@ -218,6 +217,6 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
 
     save_path = output_dir / (f"{source}_ID{larva_id}_dwell_{int(dwell_start)}-{int(dwell_end)}s_{plot_name}.png")
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    plt.close(fig)
 
     print(f"Feature plots saved -> {save_path}")
