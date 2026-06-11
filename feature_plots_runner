@@ -9,7 +9,6 @@ ANN_MASTER  = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotat
 SESSION_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
 PARQUET_PATH = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\raw_trajectories.parquet")
 MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260610_131215_train-GA1-GA3-GA2-EA-H2O")
-#MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\feature_calculation_cache")
 MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\master_feature_cache")
 PROBABILITIES = MODEL_DIR / "probabilities.csv"
 
@@ -26,14 +25,12 @@ ann_df = pd.concat(
     ignore_index=True
 )
 
+ann_df = ann_df[ann_df["behavior"]=="dwelling"].copy()
+
 # model infer features and probabilities
 prob = pd.read_csv(PROBABILITIES)
 feature_files = list(MODEL_CACHE_DIR.glob("features_*.parquet"))
 feature_dfs = {}
-
-# for f in feature_files:
-#     source = f.stem.replace("features_", "").replace("_infer", "")
-#     feature_dfs[source] = pd.read_parquet(f)
 
 for f in feature_files:
     source = f.stem.replace("features_", "")
@@ -44,7 +41,6 @@ for source, feat_df in feature_dfs.items():
     merged = feat_df.merge(prob, on=["source", "ID", "et"], how="inner")
     feat_prob_by_source[source] = merged
 
-
 #CELL 2 - view dfs
 
 with pd.option_context('display.expand_frame_repr', False):
@@ -53,7 +49,6 @@ with pd.option_context('display.expand_frame_repr', False):
     for source, feat_df in feature_dfs.items():
         print(f"\nfeatures: {source}\n",feat_df.head())
     print("\nprobabilities\n", prob.head())
-
 
 
 # CELL 3 - Run single larva plot
@@ -89,9 +84,9 @@ fp.plot_dwelling_segment(
     traj_df = traj_df,
     feat_prob_by_source = feat_prob_by_source,
     output_dir = OUTPUT_DIR,
-    source = "GA1",
-    larva_id = 999,
-    start_time = 186.942,
+    source = "GA2",
+    larva_id = 278,
+    start_time = 67.5,
     feature_list = ranked_plot_features,
     plot_name = "top_10_gini",
 )
@@ -104,12 +99,28 @@ importlib.reload(fp)
 
 ranked_features = pd.read_csv(MODEL_DIR /"plots"/"feature_ranking.txt", header=None)[0].tolist()
 wonderful_dwells = ann_df[(ann_df["behavior"] == "dwelling") & (ann_df["tags"].fillna("").str.contains("wonderful", case=False))].sort_values(["source", "ID", "t0_sec"])
-plot_features = ranked_features[:20]
+
+# Edit config
+start_larva = None  # None (starts at beginning), 0, 1, ...
+start_source = None # None, "EA", "GA1", "GA2", "GA3", "H2O"
+num_features = 10 # Number of features per figure
+num_larva = 200    # Number of figures 
+plot_name = "top{num_features}_gini"
+
+# first n wonderful by larva ID, only plotting top 10 GINI features in descending order
+plot_features = ranked_features[:num_features]
+out_folder = OUTPUT_DIR / f"Feature_plots_{num_larva}_larvae_{num_features}_features"
+out_folder.mkdir(parents=True, exist_ok=True)
 
 print(f"Found {len(wonderful_dwells)} wonderful dwellings")
 
-# first n wonderful by larva ID, only plotting top 10 GINI features in descending order
-for _, row in wonderful_dwells.head(50).iterrows():
+if start_source is not None:
+    if start_larva is None:
+        wonderful_dwells = wonderful_dwells[wonderful_dwells["source"] >= start_source]
+    else:
+        wonderful_dwells = wonderful_dwells[(wonderful_dwells["source"] > start_source) | ((wonderful_dwells["source"] == start_source) & (wonderful_dwells["ID"] >= start_larva))]
+    
+for _, row in wonderful_dwells.head(num_larva).iterrows():
 
     print(
         f"{row['source']} | "
@@ -121,10 +132,12 @@ for _, row in wonderful_dwells.head(50).iterrows():
         ann_df = ann_df,
         traj_df = traj_df,
         feat_prob_by_source = feat_prob_by_source,
-        output_dir = OUTPUT_DIR,
+        output_dir = out_folder,
         source=row["source"],
         larva_id=row["ID"],
         start_time=row["t0_sec"],
         feature_list=plot_features,
-        plot_name="top20_gini",
+        plot_name=plot_name,
     )
+
+print(f"\nDone! All {num_larva} plots saved -> {OUTPUT_DIR}")
