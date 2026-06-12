@@ -181,13 +181,13 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     # PROBABILITY PANEL
     # ==================================================
     # post processing 
-    ppc = PostProcessConfig(
-        median_filter=5,
-        threshold=0.6,
-        gap_fill_size=5.5,
-        minimum_dwell_length=13
-    )
-    plot_seg["pred_binary"] = ppc.predict(plot_seg["prob"].values)
+    # ppc = PostProcessConfig(
+    #     median_filter=5,
+    #     threshold=0.6,
+    #     gap_fill_size=5.5,
+    #     minimum_dwell_length=13
+    # )
+    # plot_seg["pred_binary"] = ppc.predict(plot_seg["prob"].values)
     
     # plot
     ax_prob.set_ylim(-0.01, 1.01)
@@ -195,7 +195,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     ax_prob.set_ylabel("Probability")
 
     ax_prob.plot(plot_seg["et"], plot_seg["prob"].values, linewidth=2, label ="Predicted probability")
-    ax_prob.step(plot_seg["et"], plot_seg["pred_binary"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label="Binary prediction (Threshold=0.6)")
+    ax_prob.step(plot_seg["et"], plot_seg["prediction"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label="Binary prediction (Threshold=0.6)")
     ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2, label="GT Dwelling")
 
     ax_prob.legend(fontsize=8, framealpha=0.5)
