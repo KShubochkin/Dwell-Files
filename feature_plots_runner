@@ -10,7 +10,7 @@ SESSION_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotat
 PARQUET_PATH = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\raw_trajectories.parquet")
 MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260610_131215_train-GA1-GA3-GA2-EA-H2O")
 MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\master_feature_cache")
-PROBABILITIES = MODEL_DIR / "probabilities.csv"
+PROBABILITIES = MODEL_DIR / "predictions" / "MF5_TH0.6_GC4_GO13_predictions.csv"
 
 OUTPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\feature_plots")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -49,7 +49,6 @@ with pd.option_context('display.expand_frame_repr', False):
     for source, feat_df in feature_dfs.items():
         print(f"\nfeatures: {source}\n",feat_df.head())
     print("\nprobabilities\n", prob.head())
-
 
 # CELL 3 - Run single larva plot
 
@@ -101,11 +100,11 @@ ranked_features = pd.read_csv(MODEL_DIR /"plots"/"feature_ranking.txt", header=N
 wonderful_dwells = ann_df[(ann_df["behavior"] == "dwelling") & (ann_df["tags"].fillna("").str.contains("wonderful", case=False))].sort_values(["source", "ID", "t0_sec"])
 
 # Edit config
-start_larva = None  # None (starts at beginning), 0, 1, ...
-start_source = None # None, "EA", "GA1", "GA2", "GA3", "H2O"
+start_larva = 3536  # None (starts at beginning), 0, 1, ...
+start_source = "GA3" # None, "EA", "GA1", "GA2", "GA3", "H2O"
 num_features = 10 # Number of features per figure
-num_larva = 200    # Number of figures 
-plot_name = "top{num_features}_gini"
+num_larva = 40    # Number of figures 
+plot_name = f"top{num_features}_gini"
 
 # first n wonderful by larva ID, only plotting top 10 GINI features in descending order
 plot_features = ranked_features[:num_features]
