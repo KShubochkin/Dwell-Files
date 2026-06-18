@@ -8,15 +8,20 @@ from pathlib import Path
 ANN_MASTER  = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs\annotation.csv")
 SESSION_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
 PARQUET_PATH = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\raw_trajectories.parquet")
-MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260610_131215_train-GA1-GA3-GA2-EA-H2O")
+MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260612_182438_train-GA1-GA3-GA2-EA-H2O")
 MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\master_feature_cache")
-PROBABILITIES = MODEL_DIR / "predictions" / "MF5_TH0.6_GC4_GO13_predictions.csv"
+PROBABILITIES = MODEL_DIR / "predictions"
+REGISTRY = MODEL_DIR / "larva_registry_after_split.csv"
 
 OUTPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\feature_plots")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # raw trajectories 
 traj_df = pd.read_parquet(PARQUET_PATH)
+
+# larva registry
+registry = pd.read_csv(REGISTRY)
+status_registry = {(row.source, row.ID): row.split for _, row in registry.iterrows()}
 
 # full annotations
 ann_df = pd.concat(
@@ -28,7 +33,8 @@ ann_df = pd.concat(
 ann_df = ann_df[ann_df["behavior"]=="dwelling"].copy()
 
 # model infer features and probabilities
-prob = pd.read_csv(PROBABILITIES)
+prob_file = next(PROBABILITIES.glob("*.csv"))
+prob = pd.read_csv(prob_file)
 feature_files = list(MODEL_CACHE_DIR.glob("features_*.parquet"))
 feature_dfs = {}
 
@@ -49,6 +55,7 @@ with pd.option_context('display.expand_frame_repr', False):
     for source, feat_df in feature_dfs.items():
         print(f"\nfeatures: {source}\n",feat_df.head())
     print("\nprobabilities\n", prob.head())
+
 
 # CELL 3 - Run single larva plot
 
@@ -73,7 +80,7 @@ plot_features = [
 ]
 
 # top 10 features
-plot_features = ranked_features[:10]
+plot_features = ranked_features[:5]
 
 ranked_plot_features = [f for f in ranked_features if f in plot_features]
 
@@ -83,13 +90,13 @@ fp.plot_dwelling_segment(
     traj_df = traj_df,
     feat_prob_by_source = feat_prob_by_source,
     output_dir = OUTPUT_DIR,
+    status_registry = status_registry,
     source = "GA2",
     larva_id = 278,
     start_time = 67.5,
     feature_list = ranked_plot_features,
-    plot_name = "top_10_gini",
+    plot_name = "top_5_gini",
 )
-
 
 # CELL 4 - Plots of first n wonderful dwelling events
 import feature_plots as fp
@@ -100,10 +107,10 @@ ranked_features = pd.read_csv(MODEL_DIR /"plots"/"feature_ranking.txt", header=N
 wonderful_dwells = ann_df[(ann_df["behavior"] == "dwelling") & (ann_df["tags"].fillna("").str.contains("wonderful", case=False))].sort_values(["source", "ID", "t0_sec"])
 
 # Edit config
-start_larva = 3536  # None (starts at beginning), 0, 1, ...
-start_source = "GA3" # None, "EA", "GA1", "GA2", "GA3", "H2O"
+start_larva = None  # None (starts at beginning), 0, 1, ...
+start_source = None # None, "EA", "GA1", "GA2", "GA3", "H2O"
 num_features = 10 # Number of features per figure
-num_larva = 40    # Number of figures 
+num_larva = 210    # Number of figures 
 plot_name = f"top{num_features}_gini"
 
 # first n wonderful by larva ID, only plotting top 10 GINI features in descending order
@@ -132,6 +139,7 @@ for _, row in wonderful_dwells.head(num_larva).iterrows():
         traj_df = traj_df,
         feat_prob_by_source = feat_prob_by_source,
         output_dir = out_folder,
+        status_registry = status_registry,
         source=row["source"],
         larva_id=row["ID"],
         start_time=row["t0_sec"],
