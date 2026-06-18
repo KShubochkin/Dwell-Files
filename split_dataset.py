@@ -39,12 +39,10 @@ import logging
 # ==========================================================
 # CONFIG
 # ==========================================================
-#INPUT_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split\all")
-#OUTPUT_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks&helpers\parquet_pipeline\annotations_split")
+INPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
+OUTPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs")
 
-
-
-def split_dataset(INPUT_DIR,OUTPUT_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_ITER=5000,RANDOM_SEED=42,mode="all"):
+def split_dataset(INPUT_DIR,OUTPUT_DIR,VAL_SPLIT_REG_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_ITER=5000,RANDOM_SEED=42,mode="all"):
     if mode == "all":
         SPLIT_DIR = OUTPUT_DIR / "split_data"
     elif mode == "train":
@@ -77,14 +75,15 @@ def split_dataset(INPUT_DIR,OUTPUT_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_
         TEST_DIR.mkdir(exist_ok=True)
         TEST_OUT = TEST_DIR / "annotations_validation.csv"
     TRAIN_DIR.mkdir(exist_ok=True)
-    
-
     TRAIN_OUT = TRAIN_DIR / "annotations_train.csv"
     
 
     LOG_FILE = RUN_DIR / "split_log.txt"
 
-    REGISTRY_SNAPSHOT = RUN_DIR / "larva_registry_after_split.csv"
+    if mode == "all":
+        REGISTRY_SNAPSHOT = RUN_DIR / "larva_registry_after_split.csv"
+    if mode == "train":
+        REGISTRY_SNAPSHOT = VAL_SPLIT_REG_DIR / "larva_registry_after_split.csv"
 
     logging.basicConfig(
         level=logging.INFO,format="%(message)s", handlers=[
@@ -252,7 +251,7 @@ def split_dataset(INPUT_DIR,OUTPUT_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_
     else:
         n_test_larvae = round(TARGET_TEST_RATIO * n_new)
         n_test_larvae = min(n_test_larvae, n_new)
-        log(f"Target new test larvae: {n_test_larvae}")
+        log(f"Target new test/validation larvae: {n_test_larvae}")
 
         rng = np.random.default_rng(RANDOM_SEED)
 
@@ -375,6 +374,7 @@ def split_dataset(INPUT_DIR,OUTPUT_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_
             ),
             "split"
         ] = "test"
+
     elif mode == "train":
         registry.loc[
             registry.apply(
@@ -395,14 +395,16 @@ def split_dataset(INPUT_DIR,OUTPUT_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_
     ] = "train"
 
     registry.to_csv(
-        REGISTRY_FILE,
-        index=False
-    )
-
+            REGISTRY_SNAPSHOT,
+            index=False
+        )
+    
     registry.to_csv(
-        REGISTRY_SNAPSHOT,
-        index=False
-    )
+            REGISTRY_FILE,
+            index=False
+        )    
+    
+    print(f"registry snapshot saved -> {REGISTRY_SNAPSHOT}")
 
     # ----------------------------------------------------------
     # REPORT LARVA COUNTS
@@ -506,3 +508,8 @@ def split_dataset(INPUT_DIR,OUTPUT_DIR,TARGET_TEST_RATIO=0.20,MIN_TAG_COUNT=5,N_
     log("\nSaved:")
     log(TRAIN_OUT)
     log(TEST_OUT)
+
+
+# ------------------- main-------------------------
+# generates test and train datasets from all
+# split_dataset(INPUT_DIR,OUTPUT_DIR, mode = "all")
