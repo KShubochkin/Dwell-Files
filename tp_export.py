@@ -42,6 +42,9 @@ from dataclasses import dataclass
 
 import pyarrow.parquet as pq
 
+import numpy as np
+from scipy.ndimage import label, binary_dilation
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,11 +527,109 @@ def predict(probabilities_path, ppc, predictions_dir, ctx, logic_file, plot=Fals
 # plot_source_grid()  — unchanged from original
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_source_grid(results_path, src, out_dir, ppc, cols=10,rows=None):
+def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5, safe_zone_size=30):
+        """
+        Computes event-based TP, FP, FN using a safe-zone (tolerance margin) approach.
+        safe_zone_size: Number of frames (y time points) to extend before and after a GT event.
+        """
+        meta_df = meta_df.reset_index(drop=True)
+        groups = (meta_df['source'] + "_" + meta_df['ID'].astype(str)).values
+        
+        tp = 0
+        fn = 0
+        fp = 0
+        
+        tp_mask = np.zeros(len(y_pred), dtype=bool)
+        fp_mask = np.zeros(len(y_pred), dtype=bool)
+        fn_mask = np.zeros(len(y_pred), dtype=bool)
+        safe_frames_global = np.zeros(len(y_pred), dtype=bool)
+        
+        global_indices = np.arange(len(y_pred))
+            
+        for g in np.unique(groups):
+            mask = groups == g
+            g_et = meta_df.loc[mask, 'et'].values
+            gap_locs = np.where(np.diff(g_et) > 0.5)[0] + 1
+            
+            y_true_seg_list = np.split(y_true[mask], gap_locs)
+            y_pred_seg_list = np.split(y_pred[mask], gap_locs)
+            idx_seg_list = np.split(global_indices[mask], gap_locs)
+            
+            for yt_seg, yp_seg,idx_seg in zip(y_true_seg_list, y_pred_seg_list,idx_seg_list):
+                if len(yt_seg) == 0:
+                    continue
+                    
+                gt_labels, num_gt = label(yt_seg)
+                yp_bool = (yp_seg > 0)  # Convert predictions to a simple boolean mask
+                
+                # ---------------------------------------------------------
+                # RULE 1: True Positives & False Negatives
+                # "for each GT event: if > %frames are predicted dwelling, +1 TP. else, +1 FN."
+                # ---------------------------------------------------------
+                for gt_idx in range(1, num_gt + 1):
+                    gt_mask = (gt_labels == gt_idx)
+                    gt_len = np.sum(gt_mask)
+                    
+                    # Count how many frames in this GT event were positively predicted
+                    predicted_frames_in_gt = np.sum(yp_bool & gt_mask)
+                    
+                    if (predicted_frames_in_gt / gt_len) > overlap_threshold:
+                        tp += 1
+                        tp_mask[idx_seg[gt_mask]] = True
+                    else:
+                        fn += 1
+                        fn_mask[idx_seg[gt_mask]] = True
+                
+                # ---------------------------------------------------------
+                # RULE 2: The Safe Zone
+                # "for each dwelling interval, there is a safe zone of y time points around it, 
+                # also including the gt dwell event itself."
+                # ---------------------------------------------------------
+                if safe_zone_size > 0:
+                    # Dilation expands the 1s in yt_seg by 'safe_zone_size' in both directions
+                    structure = np.ones(2 * safe_zone_size + 1, dtype=bool)
+                    safe_zone_mask = binary_dilation(yt_seg > 0, structure=structure)
+                else:
+                    safe_zone_mask = (yt_seg > 0)
+                    
+                # ---------------------------------------------------------
+                # RULE 3: False Positives
+                # "for each NONsafe zone area, count the number of INTERVALS of 
+                # positively predicted frames. for each, false positive +1."
+                # ---------------------------------------------------------
+                # Isolate predictions that fall completely outside the safe zones
+                nonsafe_preds = yp_bool & (~safe_zone_mask)
+                labels_fp, num_fp_intervals = label(nonsafe_preds)
+                fp += num_fp_intervals
+                fp_mask[idx_seg[nonsafe_preds]] = True
+            
+                safe_only = safe_zone_mask & (~(yt_seg > 0))
+                safe_frames_global[idx_seg[safe_only]] = True
+                
+        return tp, fp, fn, tp_mask,fp_mask,fn_mask,safe_frames_global
+
+def plot_source_grid(results_path, src, out_dir, ppc, val_keys,cols=10,rows=None,dwell_tags=["wonderful"]):
     """One figure per source — all larvae as a grid of small prob traces."""
     ppc_id    = ppc.get_IDstr()
     pred_path = results_path / f"{ppc_id}_predictions.csv"
     results   = pd.read_csv(pred_path).copy()
+    
+    results["source"] = results["source"].astype(str)
+    results["ID"]     = results["ID"].astype(str)
+    
+    # preds  = results["prediction"].values
+    # beh    = results["behavior"].values
+    # tags   = results["tags"].values
+    # dwell_mask = (beh == "dwelling") & np.isin(tags, list(dwell_tags))
+    # nd_mask    = (beh == "nondwelling")
+    # gt         = np.zeros_like(beh, dtype=int)
+    # gt[dwell_mask] = 1
+    # eval_mask  = dwell_mask | nd_mask
+    # gt_eval    = gt[eval_mask]
+    # preds_eval = preds[eval_mask]
+    # meta_eval = results.loc[eval_mask, ['source', 'ID', 'et']].reset_index(drop=True)
+    
+    #_,_,_,tp_mask,fn_mask,fp_mask,safe_frames = event_confusion_matrix(gt_eval,preds_eval,meta_eval)
 
     plt.style.use("default")
     grp_src = results[results["source"] == src]
@@ -538,21 +639,13 @@ def plot_source_grid(results_path, src, out_dir, ppc, cols=10,rows=None):
         print(f"  No tracks found for source {src}. Skipping plot.")
         return
 
-    r = 0
-    if rows == None:
-        r = int(np.ceil(len(larvae) / cols))
-    else: 
-        r = rows
+    r = int(np.ceil(len(larvae) / cols)) if rows is None else rows
         
-    fig, axes = plt.subplots(r, cols, figsize=(cols * 4, rows * 1.8), facecolor="#111")
-
-    if isinstance(axes, plt.Axes):
-        axes = [axes]
-    else:
-        axes = np.atleast_1d(axes).ravel()
+    fig, axes = plt.subplots(r, cols, figsize=(cols * 4, r * 1.8), facecolor="#111")
+    axes = [axes] if isinstance(axes, plt.Axes) else np.atleast_1d(axes).ravel()
 
     print(f"  Plotting {r*cols} tracks for source {src} in a {r}×{cols} grid…")
-    #num = len(larvae)
+    
     for i, lid in enumerate(larvae):
         if i >= r*cols: break
         #print(f"\rProgress: |{i+1}/{num}|", end="")
@@ -597,13 +690,79 @@ def plot_source_grid(results_path, src, out_dir, ppc, cols=10,rows=None):
                 ax.fill_between(et, alright_mask* -0.25, 0, alpha=0.6, color="#eab308", step="post")
             if nd_mask.any():
                 ax.fill_between(et, nd_mask     * -0.10, 0, alpha=0.4, color="#9ca3af", step="post")
+            is_val = False
+            if val_keys is not None:
+                is_val = ((val_keys["source"].astype(str) == str(src)) & (val_keys["ID"].astype(str) == str(lid))).any()
 
+            # Local Evaluation logic for the grid visual
+            safe_zone_size = 30
+            if safe_zone_size > 0:
+                structure = np.ones(2 * safe_zone_size + 1, dtype=bool)
+                safe_zone_mask = binary_dilation(won_mask > 0, structure=structure)
+            else:
+                safe_zone_mask = (won_mask > 0)
+            
+            safe_only_mask = safe_zone_mask & (won_mask == 0)
+
+            # 1. Safe Frames (Light blue diagonal hatch bottom 0.3)
+            safe_labels, num_safe = label(safe_only_mask)
+            for s_idx in range(1, num_safe + 1):
+                s_mask = (safe_labels == s_idx)
+                s_start, s_end = np.where(s_mask)[0][0], np.where(s_mask)[0][-1]
+                if et[s_end] > et[s_start]:
+                    ax.add_patch(plt.Rectangle((et[s_start], 0), et[s_end] - et[s_start], 0.3, 
+                                               facecolor='none', edgecolor='lightblue', hatch='///', linewidth=0))
+
+            # 2. TP & FN Logic
+            gt_labels, num_gt = label(won_mask)
+            for gt_idx in range(1, num_gt + 1):
+                g_mask = (gt_labels == gt_idx)
+                g_start, g_end = np.where(g_mask)[0][0], np.where(g_mask)[0][-1]
+                s_time, e_time = et[g_start], et[g_end]
+                mid_time = (s_time + e_time) / 2
+                
+                # Check overlap (TP vs FN)
+                overlap = np.sum(pred[g_mask]) / np.sum(g_mask)
+                
+                if overlap > 0.5: # True Positive
+                    ax.text(mid_time, -0.125, "TP", color="darkgreen", fontsize=7, ha="center", va="center", fontweight="bold")
+                    ax.add_patch(plt.Rectangle((s_time, 0), e_time - s_time, 1.0, 
+                                               fill=False, edgecolor="darkgreen", linestyle="--", linewidth=1))
+                else: # False Negative
+                    ax.text(mid_time, -0.125, "FN", color="yellow", fontsize=10, ha="center", va="center", fontweight="bold")
+                    ax.add_patch(plt.Rectangle((s_time, 0), e_time - s_time, 1.0, 
+                                               fill=False, edgecolor="yellow", linestyle="--", linewidth=1))
+
+            # 3. FP Logic
+            nonsafe_preds = (pred > 0) & (~safe_zone_mask) & (nd_mask > 0)
+            fp_labels, num_fp = label(nonsafe_preds)
+            for fp_idx in range(1, num_fp + 1):
+                f_mask = (fp_labels == fp_idx)
+                f_start, f_end = np.where(f_mask)[0][0], np.where(f_mask)[0][-1]
+                s_time, e_time = et[f_start], et[f_end]
+                mid_time = (s_time + e_time) / 2
+                
+                ax.text(mid_time, 0.5, "FP", color="red", fontsize=8, ha="center", va="center", fontweight="bold")
+                ax.add_patch(plt.Rectangle((s_time, 0), e_time - s_time, 1.0, 
+                                               fill=False, edgecolor="red", linestyle="--", linewidth=1))
+
+            # 4. VAL KEYS Unseen Model Star
+            if is_val:
+                annotated_mask = grp["behavior"].isin(["dwelling", "nondwelling"])
+                ann_labels, num_ann = label(annotated_mask)
+                for a_idx in range(1, num_ann + 1):
+                    a_mask = (ann_labels == a_idx)
+                    start_i = np.where(a_mask)[0][0]
+                    # Put a white star in the top left corner of the rectangle
+                    ax.plot(et[start_i], -0.025, marker='*', color='white', markersize=5, zorder=10)
+
+        # Axis cleanup
         ax.set_ylim(-0.3, 1.05)
         ax.set_title(f"ID {lid}", fontsize=7, color="#aaa", pad=2)
         if len(et) > 0:
             ax.text(0.01, 0.05, f"{et[0]:.1f}s",  transform=ax.transAxes, fontsize=5, color="#666")
-            ax.text(0.99, 0.05, f"{et[-1]:.1f}s", transform=ax.transAxes, fontsize=5, color="#666",
-                    ha="right")
+            ax.text(0.99, 0.05, f"{et[-1]:.1f}s", transform=ax.transAxes, fontsize=5, color="#666", ha="right")
+        
         ax.set_facecolor("#111")
         ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
         for spine in ax.spines.values():
@@ -619,6 +778,100 @@ def plot_source_grid(results_path, src, out_dir, ppc, cols=10,rows=None):
     plt.close(fig)
     print(f"\n  Saved: {path}")
 
+def get_event_info(preds_dir, val_dir, ppc,report_path,dwell_tags=("wonderful",),val_keys=None,train_keys=None,):
+    ppc_id   = ppc.get_IDstr()
+    preds_dir = Path(preds_dir)
+    val_dir   = Path(val_dir)
+
+    pred_path = preds_dir / f"{ppc_id}_predictions.csv"
+    results   = pd.read_csv(pred_path).copy()
+    results["source"] = results["source"].astype(str)
+    results["ID"]     = results["ID"].astype(str)
+    
+    probs  = results["prob"].values
+    preds  = results["prediction"].values
+    beh    = results["behavior"].values
+    tags   = results["tags"].values
+    
+    dwell_mask = (beh == "dwelling") & np.isin(tags, list(dwell_tags))
+    nd_mask    = (beh == "nondwelling")
+    gt         = np.zeros_like(beh, dtype=int)
+    gt[dwell_mask] = 1
+    eval_mask  = dwell_mask | nd_mask
+    
+    gt_eval    = gt[eval_mask]
+    probs_eval = probs[eval_mask]
+    preds_eval = preds[eval_mask]
+
+    report_lines = [("\nEVENT PERFORMANCE INTERVALS - ******** = validation data (unseen!)")]
+    
+    meta_eval = results.loc[eval_mask, ['source', 'ID', 'et']].reset_index(drop=True)
+    tp_ev, fp_ev, fn_ev, tp_mask, fp_mask, fn_mask, safe_frames = event_confusion_matrix(
+        gt_eval, preds_eval, meta_eval, overlap_threshold=0.5
+    )
+    
+    report_lines.extend([
+                f"TP_ev = {tp_ev}",
+                f"FN_ev = {fn_ev}",
+                f"FP_ev = {fp_ev}",
+                "FALSE POSITIVE EVENTS:",
+            ])
+    fp_labels, num_fp = label(fp_mask)
+    for fp in range(1, num_fp + 1):
+        f_mask_bool = (fp_labels == fp)
+        fst, fe = np.where(f_mask_bool)[0][0], np.where(f_mask_bool)[0][-1]
+        
+        # Extract details safely from meta_eval
+        src_val = meta_eval.loc[fst, 'source']
+        id_val  = meta_eval.loc[fst, 'ID']
+        st      = meta_eval.loc[fst, 'et']
+        et_val  = meta_eval.loc[fe, 'et']
+        
+        is_val = False
+        if val_keys is not None:
+            is_val = ((val_keys["source"].astype(str) == str(src_val)) & (val_keys["ID"].astype(str) == str(id_val))).any()
+        
+        if is_val:
+            report_lines.extend([
+                f"{src_val} {id_val}: {st:.1f} - {et_val:.1f}s ********"
+            ])
+        else:
+            report_lines.extend([
+                f"{src_val} {id_val}: {st:.1f} - {et_val:.1f}s"
+            ])
+
+    report_lines.extend([
+        "FALSE NEGATIVE EVENTS:",
+    ])
+    
+    # Label the MASK, not the integer count
+    fn_labels, num_fn = label(fn_mask)
+    for fn in range(1, num_fn + 1):
+        f_mask_bool = (fn_labels == fn)
+        fst, fe = np.where(f_mask_bool)[0][0], np.where(f_mask_bool)[0][-1]
+        
+        # Extract details safely from meta_eval
+        src_val = meta_eval.loc[fst, 'source']
+        id_val  = meta_eval.loc[fst, 'ID']
+        st      = meta_eval.loc[fst, 'et']
+        et_val  = meta_eval.loc[fe, 'et']
+        
+        is_val = False
+        if val_keys is not None:
+            is_val = ((val_keys["source"].astype(str) == str(src_val)) & (val_keys["ID"].astype(str) == str(id_val))).any()
+        if is_val:
+            report_lines.extend([
+                f"{src_val} {id_val}: {st:.1f} - {et_val:.1f}s ********"
+            ])
+        else:
+            report_lines.extend([
+                f"{src_val} {id_val}: {st:.1f} - {et_val:.1f}s"
+            ])
+            
+    with open(report_path, "a") as f:
+        f.write("\n".join(report_lines) + "\n")
+        
+    
 
 # ─────────────────────────────────────────────────────────────────────────────
 # assess_performance()  — logic unchanged, signature unchanged
@@ -655,7 +908,7 @@ def assess_performance(
     results   = pd.read_csv(pred_path).copy()
     results["source"] = results["source"].astype(str)
     results["ID"]     = results["ID"].astype(str)
-
+    
     # ── Restrict to val_keys if provided ─────────────────────────────────────
     if val_keys is not None:
         vk = val_keys.copy()
@@ -705,7 +958,7 @@ def assess_performance(
     preds  = results["prediction"].values
     beh    = results["behavior"].values
     tags   = results["tags"].values
-
+    
     wonderful  = ((results["behavior"] == "dwelling") &
                    results["tags"].astype(str).str.contains("wonderful", na=False, case=False)).astype(int)
     nondwelling= (results["behavior"] == "nondwelling").astype(int)
@@ -720,73 +973,6 @@ def assess_performance(
         tns = (nd    == 1) & (preds == 0)
         return tps.sum(), tns.sum(), fps.sum(), fns.sum(), dwell.sum(), nd.sum()
     
-    def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5):
-        """
-        Computes event-based TP, FP, FN by aggregating overlapping predictions
-        per GT interval to avoid falsely punishing fragmented predictions as FPs.
-        """
-        from scipy.ndimage import label
-        import numpy as np
-        
-        meta_df = meta_df.reset_index(drop=True)
-        groups = (meta_df['source'] + "_" + meta_df['ID'].astype(str)).values
-        
-        tp = 0
-        fn = 0
-        fp = 0
-        
-        for g in np.unique(groups):
-            mask = groups == g
-            g_et = meta_df.loc[mask, 'et'].values
-            gap_locs = np.where(np.diff(g_et) > 0.5)[0] + 1
-            
-            y_true_seg_list = np.split(y_true[mask], gap_locs)
-            y_pred_seg_list = np.split(y_pred[mask], gap_locs)
-            
-            for yt_seg, yp_seg in zip(y_true_seg_list, y_pred_seg_list):
-                if len(yt_seg) == 0:
-                    continue
-                    
-                gt_labels, num_gt = label(yt_seg)
-                pred_labels, num_pred = label(yp_seg)
-                
-                # Keep track of which predicted labels are 'whitelisted' as useful
-                whitelisted_preds = set()
-                # Keep track of predicted labels that touched failed GT intervals
-                tainted_preds = set()
-                
-                # Evaluate Ground Truth Events first
-                for gt_idx in range(1, num_gt + 1):
-                    gt_mask = (gt_labels == gt_idx)
-                    gt_len = np.sum(gt_mask)
-                    
-                    # Identify all predicted events overlapping this specific GT interval
-                    overlapping_preds = np.unique(pred_labels[gt_mask])
-                    overlapping_preds = overlapping_preds[overlapping_preds != 0]
-                    
-                    # Calculate aggregated overlap frames from ALL intersecting predictions
-                    total_overlap_frames = 0
-                    for p_idx in overlapping_preds:
-                        pred_mask = (pred_labels == p_idx)
-                        total_overlap_frames += np.sum(gt_mask & pred_mask)
-                    
-                    aggregate_overlap_pct = total_overlap_frames / gt_len
-                    
-                    if aggregate_overlap_pct >= overlap_threshold:
-                        tp += 1
-                        # Whitelist EVERY prediction interval that contributed to this success
-                        for p_idx in overlapping_preds:
-                            whitelisted_preds.add(p_idx)
-                    else:
-                        fn += 1
-                        # Mark these predictions as having touched a failed GT event
-                
-                # Evaluate Predicted Events for False Positives
-                for p_idx in range(1, num_pred + 1):
-                    # An interval is a False Positive if it wasn't part of any successful TP
-                    if p_idx not in whitelisted_preds:
-                        fp += 1
-        return tp, fp, fn
 
     def expected_calibration_error(y_true, y_prob, n_bins=10):
         prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins,
@@ -807,7 +993,7 @@ def assess_performance(
     gt         = np.zeros_like(beh, dtype=int)
     gt[dwell_mask] = 1
     eval_mask  = dwell_mask | nd_mask
-
+    
     gt_eval    = gt[eval_mask]
     probs_eval = probs[eval_mask]
     preds_eval = preds[eval_mask]
@@ -887,8 +1073,10 @@ def assess_performance(
         ])
 
         meta_eval = results.loc[eval_mask, ['source', 'ID', 'et']].reset_index(drop=True)
-        tp_ev, fp_ev, fn_ev = event_confusion_matrix(gt_eval, preds_eval, meta_eval, overlap_threshold=0.3)
-        
+        tp_ev, fp_ev, fn_ev, tp_mask, fp_mask, fn_mask, safe_frames = event_confusion_matrix(
+            gt_eval, preds_eval, meta_eval, overlap_threshold=0.5
+        )
+                
         if plots is not None:
             plt.style.use("seaborn-v0_8-whitegrid")
 
@@ -954,8 +1142,11 @@ def assess_performance(
             ax.set_title(f"Event Confusion Matrix - {ppc_id}")
             fig.savefig(plot_dir / f"Event_Confusion_Matrix.png",bbox_inches="tight",dpi=300)
             plt.close(fig)
-        
-        
+            
+            
+                
+                
+             
 
     with open(report_path, "a") as f:
         f.write("\n".join(report_lines) + "\n")
