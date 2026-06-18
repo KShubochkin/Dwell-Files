@@ -13,7 +13,7 @@ import matplotlib.patheffects as pe
 import numpy as np
 from tp_export import PostProcessConfig
 
-def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, source, larva_id, start_time, feature_list=[], plot_name=''):
+def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, status_registry, source, larva_id, start_time, feature_list=[], plot_name=''):
 
     feat_prob_df = feat_prob_by_source[source]
 
@@ -24,6 +24,9 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
         (ann_df["behavior"] == "dwelling") &
         (abs(ann_df["t0_sec"] - start_time) < 1)
     ].iloc[0]
+
+    # Determine if larva is in train or validation dataset
+    larva_status = status_registry.get((source, larva_id), "Validation").capitalize()  # Validation = both validation and test larvae (i.e. unseen by model in training)
 
     # --- Determine plotting window ---
     # Include +/- 50s outside of dwelling, but crop to avoid including another dwelling event in the window
@@ -105,7 +108,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     duration = dwell_end - dwell_start
 
     ax_traj.set_title(
-        f"{source} | ID {larva_id} | "
+        f"{larva_status} - {source} | ID {larva_id} | "
         f"Dwelling: {dwell_start:.1f}s → {dwell_end:.1f}s "
         f"({duration:.1f}s)"
     )
@@ -180,15 +183,6 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     # ==================================================
     # PROBABILITY PANEL
     # ==================================================
-    # post processing 
-    # ppc = PostProcessConfig(
-    #     median_filter=5,
-    #     threshold=0.6,
-    #     gap_fill_size=5.5,
-    #     minimum_dwell_length=13
-    # )
-    # plot_seg["pred_binary"] = ppc.predict(plot_seg["prob"].values)
-    
     # plot
     ax_prob.set_ylim(-0.01, 1.01)
     ax_prob.set_xlabel("Time (s)")
@@ -215,7 +209,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, sour
     
     plt.tight_layout()
 
-    save_path = output_dir / (f"{source}_ID{larva_id}_dwell_{int(dwell_start)}-{int(dwell_end)}s_{plot_name}.png")
+    save_path = output_dir / (f"{larva_status} - {source}_ID{larva_id}_dwell_{int(dwell_start)}-{int(dwell_end)}s_{plot_name}.png")
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
