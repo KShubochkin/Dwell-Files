@@ -4,17 +4,26 @@
 
 import pandas as pd
 from pathlib import Path
+from collections import defaultdict
+import pyarrow.parquet as pq
+import json
+import gc
+import re
 
 ANN_MASTER  = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs\annotation.csv")
 SESSION_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\annotation\annotation_csvs_all")
 PARQUET_PATH = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\raw_trajectories.parquet")
-MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260612_182438_train-GA1-GA3-GA2-EA-H2O")
-MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\master_feature_cache")
+MODEL_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\RUN_feature_registry_test_20260612_173616_train-GA1-GA3-GA2-EA-H2O")
+MODEL_CACHE_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\optimizer\master_feature_cache")
 PROBABILITIES = MODEL_DIR / "predictions"
 REGISTRY = MODEL_DIR / "larva_registry_after_split.csv"
 
 OUTPUT_DIR = Path(r"C:\Users\Tomoko\Desktop\Dwelling_Project\parquet_pipeline\exported_models\feature_plots")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# extract threshold
+plot_config_dir = next(p for p in (MODEL_DIR / "plots").iterdir() if p.is_dir() and "_TH" in p.name)
+threshold = float(re.search(r"TH([0-9]+(?:\.[0-9]+)?)", plot_config_dir.name).group(1))
 
 # raw trajectories 
 traj_df = pd.read_parquet(PARQUET_PATH)
@@ -32,20 +41,57 @@ ann_df = pd.concat(
 
 ann_df = ann_df[ann_df["behavior"]=="dwelling"].copy()
 
-# model infer features and probabilities
-prob_file = next(PROBABILITIES.glob("*.csv"))
-prob = pd.read_csv(prob_file)
-feature_files = list(MODEL_CACHE_DIR.glob("features_*.parquet"))
-feature_dfs = {}
+# Model features - only load feature columns used by model
+FEATURE_CONFIG = MODEL_DIR / "feature_set_config.json"  # adjust filename if needed
+with open(FEATURE_CONFIG) as f:
+    feature_config = json.load(f)
 
-for f in feature_files:
-    source = f.stem.replace("features_", "")
-    feature_dfs[source] = pd.read_parquet(f)
+KEY_COLS     = ["source", "ID", "et"]
+WANTED_FEATS = feature_config["all_columns"]
+
+def safe_read(path, wanted_feats):
+    schema_cols = pq.read_schema(path).names
+    feat_cols   = [c for c in wanted_feats if c in schema_cols]
+    return pd.read_parquet(path, columns=KEY_COLS + feat_cols)
+
+# Group cache fragments by source — loop runs ONCE
+groups = defaultdict(list)
+for f in MODEL_CACHE_DIR.glob("features_*.parquet"):
+    source = f.stem.replace("features_", "").split("_batch_")[0]
+    groups[source].append(f)
+
+# Reconstruct one dataframe per source
+feature_dfs = {}
+for source, files in groups.items():
+    base_files  = [f for f in files if "_batch_" not in f.stem]
+    batch_files = sorted([f for f in files if "_batch_" in f.stem])
+
+    merged = safe_read(base_files[0], WANTED_FEATS)
+    print(f"  [{source}] base shape: {merged.shape}")
+
+    for batch_file in batch_files:
+        print(f"  merging {batch_file.name}")
+        batch_df    = safe_read(batch_file, WANTED_FEATS)
+        cols_to_add = [c for c in batch_df.columns if c not in KEY_COLS]
+        if not cols_to_add:
+            print(f"    no new feature columns in {batch_file.name}, skipping")
+            del batch_df
+            continue
+        merged = merged.merge(batch_df[KEY_COLS + cols_to_add], on=KEY_COLS, how="left")
+        del batch_df
+        gc.collect()
+
+    feature_dfs[source] = merged
+    print(f"  [{source}] final shape: {merged.shape}")
+
+# Merge with probabilities
+prob_file = next(PROBABILITIES.glob("*.csv"))
+prob = pd.read_csv(prob_file, low_memory=False)
+prob["et"] = prob["et"].astype("float32")
 
 feat_prob_by_source = {}
 for source, feat_df in feature_dfs.items():
-    merged = feat_df.merge(prob, on=["source", "ID", "et"], how="inner")
-    feat_prob_by_source[source] = merged
+    feat_prob_by_source[source] = feat_df.merge(prob, on=KEY_COLS, how="left")
 
 #CELL 2 - view dfs
 
@@ -55,6 +101,8 @@ with pd.option_context('display.expand_frame_repr', False):
     for source, feat_df in feature_dfs.items():
         print(f"\nfeatures: {source}\n",feat_df.head())
     print("\nprobabilities\n", prob.head())
+    for source, df in feat_prob_by_source.items():
+        print(f"\nfeatures and probabilities: {source}\n", df.head())
 
 
 # CELL 3 - Run single larva plot
@@ -96,7 +144,9 @@ fp.plot_dwelling_segment(
     start_time = 67.5,
     feature_list = ranked_plot_features,
     plot_name = "top_5_gini",
+    threshold = threshold,
 )
+
 
 # CELL 4 - Plots of first n wonderful dwelling events
 import feature_plots as fp
@@ -110,7 +160,7 @@ wonderful_dwells = ann_df[(ann_df["behavior"] == "dwelling") & (ann_df["tags"].f
 start_larva = None  # None (starts at beginning), 0, 1, ...
 start_source = None # None, "EA", "GA1", "GA2", "GA3", "H2O"
 num_features = 10 # Number of features per figure
-num_larva = 210    # Number of figures 
+num_larva = 4    # Number of figures 
 plot_name = f"top{num_features}_gini"
 
 # first n wonderful by larva ID, only plotting top 10 GINI features in descending order
@@ -145,6 +195,7 @@ for _, row in wonderful_dwells.head(num_larva).iterrows():
         start_time=row["t0_sec"],
         feature_list=plot_features,
         plot_name=plot_name,
+        threshold = threshold,
     )
 
 print(f"\nDone! All {num_larva} plots saved -> {OUTPUT_DIR}")
