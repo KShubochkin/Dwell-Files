@@ -13,7 +13,7 @@ import matplotlib.patheffects as pe
 import numpy as np
 from tp_export import PostProcessConfig
 
-def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, status_registry, source, larva_id, start_time, feature_list=[], plot_name=''):
+def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, status_registry, source, larva_id, start_time, feature_list=[], plot_name='', threshold=None):
 
     feat_prob_df = feat_prob_by_source[source]
 
@@ -189,7 +189,8 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
     ax_prob.set_ylabel("Probability")
 
     ax_prob.plot(plot_seg["et"], plot_seg["prob"].values, linewidth=2, label ="Predicted probability")
-    ax_prob.step(plot_seg["et"], plot_seg["prediction"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label="Binary prediction (Threshold=0.6)")
+    threshold_label = (f"Binary prediction (Threshold={threshold})")
+    ax_prob.step(plot_seg["et"], plot_seg["prediction"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label=threshold_label)
     ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2, label="GT Dwelling")
 
     ax_prob.legend(fontsize=8, framealpha=0.5)
