@@ -107,7 +107,7 @@ with pd.option_context('display.expand_frame_repr', False):
 
 # CELL 3 - Run single larva plot
 
-import feature_plots as fp
+import feature_plots_v3 as fp
 import importlib
 importlib.reload(fp)
 
@@ -145,11 +145,11 @@ fp.plot_dwelling_segment(
     feature_list = ranked_plot_features,
     plot_name = "top_5_gini",
     threshold = threshold,
+    plot_mode = "prediction",
 )
 
-
 # CELL 4 - Plots of first n wonderful dwelling events
-import feature_plots as fp
+import feature_plots_v3 as fp
 import importlib
 importlib.reload(fp)
 
@@ -160,12 +160,15 @@ wonderful_dwells = ann_df[(ann_df["behavior"] == "dwelling") & (ann_df["tags"].f
 start_larva = None  # None (starts at beginning), 0, 1, ...
 start_source = None # None, "EA", "GA1", "GA2", "GA3", "H2O"
 num_features = 10 # Number of features per figure
-num_larva = 4    # Number of figures 
+num_larva = None    # Number of figures (None plots all larvae)
 plot_name = f"top{num_features}_gini"
+plot_mode = "prediction"
 
 # first n wonderful by larva ID, only plotting top 10 GINI features in descending order
 plot_features = ranked_features[:num_features]
-out_folder = OUTPUT_DIR / f"Feature_plots_{num_larva}_larvae_{num_features}_features"
+
+larva_label = f"all_{len(wonderful_dwells)}" if num_larva is None else str(num_larva)
+out_folder = OUTPUT_DIR / (f"Feature_plots_{plot_mode}_{larva_label}_larvae_{num_features}_features")
 out_folder.mkdir(parents=True, exist_ok=True)
 
 print(f"Found {len(wonderful_dwells)} wonderful dwellings")
@@ -176,8 +179,12 @@ if start_source is not None:
     else:
         wonderful_dwells = wonderful_dwells[(wonderful_dwells["source"] > start_source) | ((wonderful_dwells["source"] == start_source) & (wonderful_dwells["ID"] >= start_larva))]
     
-for _, row in wonderful_dwells.head(num_larva).iterrows():
+if num_larva is None:
+    dwells_to_plot = wonderful_dwells
+else:
+    dwells_to_plot = wonderful_dwells.head(num_larva)
 
+for _, row in dwells_to_plot.iterrows():
     print(
         f"{row['source']} | "
         f"ID={row['ID']} | "
@@ -196,6 +203,8 @@ for _, row in wonderful_dwells.head(num_larva).iterrows():
         feature_list=plot_features,
         plot_name=plot_name,
         threshold = threshold,
+        plot_mode = plot_mode,
     )
 
-print(f"\nDone! All {num_larva} plots saved -> {OUTPUT_DIR}")
+n_plotted = len(dwells_to_plot)
+print(f"\nDone! All {n_plotted} plots saved -> {OUTPUT_DIR}")
