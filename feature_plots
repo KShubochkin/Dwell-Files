@@ -1,4 +1,4 @@
-# feature_plots
+# feature_plots_v3
 
 '''
 Builds plots showing:
@@ -11,19 +11,53 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import matplotlib.patheffects as pe
 import numpy as np
-from tp_export import PostProcessConfig
+import pandas as pd
 
-def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, status_registry, source, larva_id, start_time, feature_list=[], plot_name='', threshold=None):
+def plot_dwelling_segment(
+    ann_df,
+    traj_df,
+    feat_prob_by_source,
+    output_dir,
+    status_registry,
+    source,
+    larva_id,
+    start_time,
+    feature_list=[],
+    plot_name='',
+    threshold=None,
+    plot_mode="annotation"   
+):
 
     feat_prob_df = feat_prob_by_source[source]
+    
+    pred_df = feat_prob_df[(feat_prob_df["source"] == source) & (feat_prob_df["ID"] == larva_id)].sort_values("et")
+    pred = pred_df["prediction"].values.astype(int)
 
-    # Find annotation event
-    event = ann_df[
-        (ann_df["source"] == source) &
-        (ann_df["ID"] == larva_id) &
-        (ann_df["behavior"] == "dwelling") &
-        (abs(ann_df["t0_sec"] - start_time) < 1)
-    ].iloc[0]
+    changes = np.diff(pred)  # where predicted dwelling starts/ends
+    starts = np.where(changes == 1)[0] + 1
+    ends = np.where(changes == -1)[0] + 1
+
+    if len(pred) > 0:
+        if pred[0] == 1:
+            starts = np.insert(starts, 0, 0)
+        if pred[-1] == 1:
+            ends = np.append(ends, len(pred))
+
+    pred_events = pd.DataFrame({"t0_sec": pred_df.iloc[starts]["et"].values, "t1_sec": pred_df.iloc[ends - 1]["et"].values})
+
+    # Find annotation event if mode = annotation (i.e. plotting annotated dwelling)
+    if plot_mode == "annotation":
+
+        event = ann_df[
+            (ann_df["source"] == source) &
+            (ann_df["ID"] == larva_id) &
+            (ann_df["behavior"] == "dwelling") &
+            (abs(ann_df["t0_sec"] - start_time) < 1)
+        ].iloc[0]
+
+    else:
+        idx = np.argmin(np.abs(pred_events["t0_sec"] - start_time))
+        event = pred_events.iloc[idx]
 
     # Determine if larva is in train or validation dataset
     larva_status = status_registry.get((source, larva_id), "Validation").capitalize()  # Validation = both validation and test larvae (i.e. unseen by model in training)
@@ -45,12 +79,15 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
     window_start = max(dwell_start - PRE_WINDOW, 0)
     window_end = min(dwell_end + POST_WINDOW, max_time)
 
-    # Find all dwelling events for this larva
-    larva_events = ann_df[
-        (ann_df["source"] == source) &
-        (ann_df["ID"] == larva_id) &
-        (ann_df["behavior"] == "dwelling")
-    ].sort_values("t0_sec")
+    # Find all dwelling events for this larva (for both modes)
+    if plot_mode == "annotation":
+        larva_events = ann_df[
+            (ann_df["source"] == source) &
+            (ann_df["ID"] == larva_id) &
+            (ann_df["behavior"] == "dwelling")
+        ].sort_values("t0_sec")
+    else:
+        larva_events = pred_events.sort_values("t0_sec")
 
     prev_events = larva_events[larva_events["t1_sec"] < dwell_start]
 
@@ -127,8 +164,8 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
     x_range = fx.max() - fx.min()
     y_range = fy.max() - fy.min()
 
-    pad_x = max(1, x_range * 0.05)
-    pad_y = max(1, y_range * 0.1)
+    # pad_x = max(1, x_range * 0.05)
+    # pad_y = max(1, y_range * 0.1)
 
     ax_traj.set_aspect("equal", adjustable="datalim")
     ax_traj.set_box_aspect(0.65)
@@ -172,9 +209,12 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
         ax_traj.plot(row["x"], row["y"], "o", ms=4, mfc="none", mec="black", zorder=6)
 
     # legend
+    dwelling_label = ("GT dwelling" if plot_mode == "annotation" else "Predicted dwelling")
+    non_dwell_label = ("Unannotated" if plot_mode == "annotation" else "Predicted non-dwelling")
+    
     legend_traj = [
-        Line2D([0], [0], color="green", linewidth=3, label="GT Dwelling"),
-        Line2D( [0], [0], color="purple", linewidth=2,label="Non-dwelling"),
+        Line2D([0], [0], color="green", linewidth=3, label=dwelling_label),
+        Line2D( [0], [0], color="purple", linewidth=2,label=non_dwell_label),
         Line2D([0], [0],  marker="o", color="darkturquoise", linestyle="None", markersize=8, label="Window start"),
         Line2D([0], [0], marker="o", color="orange", linestyle="None", markersize=8, label="Window end")
     ]
@@ -191,7 +231,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
     ax_prob.plot(plot_seg["et"], plot_seg["prob"].values, linewidth=2, label ="Predicted probability")
     threshold_label = (f"Binary prediction (Threshold={threshold})")
     ax_prob.step(plot_seg["et"], plot_seg["prediction"], where="post", color="#2893e5", linestyle = "--", linewidth=2, label=threshold_label)
-    ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2, label="GT Dwelling")
+    ax_prob.axvspan(dwell_start, dwell_end, alpha=0.2, label=dwelling_label)
 
     ax_prob.legend(fontsize=8, framealpha=0.5)
 
@@ -201,7 +241,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
 
     for ax, feature in zip(ax_feat, feature_list):
         ax.plot(plot_seg["et"], plot_seg[feature], linewidth=2, color="#CB5141")
-        ax.axvspan(dwell_start, dwell_end, alpha=0.2, color="#d9a783", label="GT Dwelling")
+        ax.axvspan(dwell_start, dwell_end, alpha=0.2, color="#d9a783", label=dwelling_label)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(feature)
         ax_feat[-1].set_xlabel("Time (s)")
@@ -210,7 +250,7 @@ def plot_dwelling_segment(ann_df, traj_df, feat_prob_by_source, output_dir, stat
     
     plt.tight_layout()
 
-    save_path = output_dir / (f"{larva_status} - {source}_ID{larva_id}_dwell_{int(dwell_start)}-{int(dwell_end)}s_{plot_name}.png")
+    save_path = output_dir / (f"{larva_status} - {plot_mode}_{source}_ID{larva_id}_dwell_{int(dwell_start)}-{int(dwell_end)}s_{plot_name}.png")
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
