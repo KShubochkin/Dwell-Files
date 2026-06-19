@@ -181,12 +181,12 @@ def calc_angle_vec(p1x, p1y, p2x, p2y, p3x, p3y):
 
 
 @numba.njit
-def _revisit_numba(x, y, w):
+def _revisit_numba(x, y, w, min_lag): # added min_lag to ignore recent frame
     n = len(x)
     out = np.zeros(n, dtype=np.float32)
     for i in range(w, n):
         min_dist = 1e9
-        for j in range(1, w):
+        for j in range(min_lag, w):
             d = np.sqrt((x[i] - x[i - j]) ** 2 + (y[i] - y[i - j]) ** 2)
             if d < min_dist:
                 min_dist = d
@@ -194,11 +194,22 @@ def _revisit_numba(x, y, w):
     return out
 
 
-def _revisit_series(group_df: pd.DataFrame, w: int) -> pd.Series:
-    arr = _revisit_numba(group_df["x"].values, group_df["y"].values, w)
-    return pd.Series(arr, index=group_df.index, dtype="float32")
+def _revisit_series(group_df, w, min_lag):
 
+    min_dist = _revisit_numba(group_df["x"].values, group_df["y"].values, w, min_lag)
+    # only used for revisitation_rate
+    revisit_hit = (min_dist < (0.5 * group_df["group_medians"].values)).astype(np.float32)
+    return pd.DataFrame({"revisit_dist": min_dist.astype(np.float32), "revisit_hit": revisit_hit}, index=group_df.index)
 
+def _get_revisit_tmp(df, w, fps):
+    w = int(w * fps)
+    min_lag = int(2 * fps)
+    parts = []
+    for _, g in df.groupby(["source", "ID"], sort=False):
+        parts.append(_revisit_series(g, w, min_lag))
+    return pd.concat(parts).reindex(df.index)
+
+    
 def get_windowed_freq(signal: np.ndarray, fps: float, window_seconds: float) -> np.ndarray:
     """Dominant frequency at each frame via STFT."""
     nperseg = int(window_seconds * fps)
@@ -440,40 +451,25 @@ register("reversal_rate", version=1, fn=_reversal_rate)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _revisitation_mean(df, feat, w, fps, g_inst, g_win, groups_ser):
-    _tmp = f"__rev_{w}"
-    df[_tmp] = (
-        df.groupby(["source", "ID"], group_keys=False)
-          .apply(lambda g: _revisit_series(g, w))
-    )
-    result = (
-        g_inst[_tmp]
-          .rolling(window=w, min_periods=1)
-          .mean()
-          .reset_index(level=[0, 1], drop=True)
-    ).astype("float32")
-    df.drop(columns=[_tmp], inplace=True)
-    return result
+    tmp = _get_revisit_tmp(df, w, fps)
+    return (tmp["revisit_dist"].groupby(groups_ser).transform(lambda x: x.rolling(int(w * fps), min_periods=1).mean()).astype("float32"))
 
-register("revisitation_mean", version=1, fn=_revisitation_mean)
+register("revisitation_mean", version=2, fn=_revisitation_mean)
 
 
 def _revisitation_mean_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
-    _tmp = f"__rev_norm_{w}"
-    df[_tmp] = (
-        df.groupby(["source", "ID"], group_keys=False)
-          .apply(lambda g: _revisit_series(g, w))
-    )
-    result = (
-        g_inst[_tmp]
-          .rolling(window=w, min_periods=1)
-          .mean()
-          .reset_index(level=[0, 1], drop=True)
-        / (df["group_medians"] + 1e-6)
-    ).astype("float32")
-    df.drop(columns=[_tmp], inplace=True)
-    return result
+    tmp = _get_revisit_tmp(df, w, fps)
+    mean_dist = (tmp["revisit_dist"].groupby(groups_ser).transform(lambda x: x.rolling(int(w * fps), min_periods=1).mean()))
+    return (mean_dist / (df["group_medians"] + 1e-6)).astype("float32")
 
-register("revisitation_mean_norm", version=1, fn=_revisitation_mean_norm)
+register("revisitation_mean_norm", version=2, fn=_revisitation_mean_norm)
+
+
+def _revisitation_rate(df, feat, w, fps, g_inst, g_win, groups_ser):
+    tmp = _get_revisit_tmp(df, w, fps)
+    return (tmp["revisit_hit"].groupby(groups_ser).transform(lambda x: x.rolling(int(w * fps), min_periods=1).mean()).astype("float32"))
+
+register("revisitation_rate", version=1, fn=_revisitation_rate)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
