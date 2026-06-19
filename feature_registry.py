@@ -40,6 +40,7 @@ import pandas as pd
 import numba
 from scipy.signal import spectrogram
 from scipy.spatial import ConvexHull
+import time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +64,9 @@ CONFIG = {
     "pause_threshold":  0.15,
     "min_coverage":     0.1,
     "fps":              6.0,
+    "turn_amp_quantile":  0.75,   # percentile of combined turn/head-cast signal used as event threshold
+    "turn_min_sep_sec":   0.5,    # refractory period between detected turn events
+
 }
 
 
@@ -170,6 +174,18 @@ def _roll(g_win, col: str, stat: str) -> pd.Series:
         return res.reset_index(level=[0, 1], drop=True)
     return res
 
+def _roll_fresh(df, col: str, w_frames: int, stat: str) -> pd.Series:
+    """Like _roll(), but builds its own GroupBy+Rolling off the live df instead
+    of the orchestrator's pre-built g_win — required for any column you add
+    to df during this window's pass, since g_win snapshots its column set at
+    construction time and raises KeyError for anything added afterward."""
+    res = getattr(
+        df.groupby(["source", "ID"])[col].rolling(window=w_frames, min_periods=1, center=True),
+        stat,
+    )()
+    if isinstance(res.index, pd.MultiIndex):
+        return res.reset_index(level=[0, 1], drop=True)
+    return res
 
 def calc_angle_vec(p1x, p1y, p2x, p2y, p3x, p3y):
     """Vectorised bending angle (degrees)."""
@@ -179,37 +195,249 @@ def calc_angle_vec(p1x, p1y, p2x, p2y, p3x, p3y):
     mag = np.sqrt(v1x**2 + v1y**2) * np.sqrt(v2x**2 + v2y**2)
     return np.degrees(np.arccos(np.clip(dot / (mag + 1e-6), -1.0, 1.0)))
 
+def _angle_between_vectors(v1x, v1y, v2x, v2y):
+    """Angle (degrees) between two free vectors (no shared vertex required)."""
+    dot = v1x * v2x + v1y * v2y
+    mag = np.sqrt(v1x**2 + v1y**2) * np.sqrt(v2x**2 + v2y**2)
+    return np.degrees(np.arccos(np.clip(dot / (mag + 1e-6), -1.0, 1.0)))
 
 @numba.njit
-def _revisit_numba(x, y, w, min_lag): # added min_lag to ignore recent frame
+def _revisit_numba(x, y, w):
     n = len(x)
     out = np.zeros(n, dtype=np.float32)
     for i in range(w, n):
         min_dist = 1e9
-        for j in range(min_lag, w):
+        for j in range(1, w):
             d = np.sqrt((x[i] - x[i - j]) ** 2 + (y[i] - y[i - j]) ** 2)
             if d < min_dist:
                 min_dist = d
         out[i] = min_dist
     return out
 
+def _revisit_stats_shared(df, w, g_inst):
+    cache = df.attrs.setdefault("_revisit_cache", {})
+    if w not in cache:
+        x_arr = df["x"].to_numpy(dtype=np.float64)
+        y_arr = df["y"].to_numpy(dtype=np.float64)
+        out = np.zeros(len(df), dtype=np.float32)
+        for _, idx in g_inst.indices.items():
+            order = np.sort(idx)
+            out[order] = _revisit_numba(x_arr[order], y_arr[order], w)
+        cache[w] = out
+    return cache[w]
 
-def _revisit_series(group_df, w, min_lag):
-
-    min_dist = _revisit_numba(group_df["x"].values, group_df["y"].values, w, min_lag)
-    # only used for revisitation_rate
-    revisit_hit = (min_dist < (0.5 * group_df["group_medians"].values)).astype(np.float32)
-    return pd.DataFrame({"revisit_dist": min_dist.astype(np.float32), "revisit_hit": revisit_hit}, index=group_df.index)
-
-def _get_revisit_tmp(df, w, fps):
-    w = int(w * fps)
-    min_lag = int(2 * fps)
-    parts = []
-    for _, g in df.groupby(["source", "ID"], sort=False):
-        parts.append(_revisit_series(g, w, min_lag))
-    return pd.concat(parts).reindex(df.index)
-
+@numba.njit(fastmath=True)
+def _rolling_pca_stats(x, y, w_frames):
+    """
+    Computes PCA ratio (Feature 11) and PCA Area (Feature 8 proxy) efficiently.
+    Returns a 2D array: [pca_ratio, pca_area]
+    """
+    n = len(x)
+    out = np.zeros((n, 2), dtype=np.float32)
+    half_w = w_frames // 2
     
+    for i in range(n):
+        start = max(0, i - half_w)
+        end = min(n, i + half_w + 1)
+        
+        if end - start < 3:
+            continue
+            
+        wx = x[start:end]
+        wy = y[start:end]
+        mx = np.mean(wx)
+        my = np.mean(wy)
+        
+        cxx = np.sum((wx - mx)**2)
+        cyy = np.sum((wy - my)**2)
+        cxy = np.sum((wx - mx)*(wy - my))
+        
+        trace = cxx + cyy
+        det = cxx * cyy - cxy**2
+        discriminant = max(0.0, trace**2 - 4*det)
+        
+        l1 = (trace + np.sqrt(discriminant)) / 2.0
+        l2 = (trace - np.sqrt(discriminant)) / 2.0
+        
+        if l1 > 1e-6:
+            out[i, 0] = l2 / l1  # PCA Ratio
+            out[i, 1] = np.pi * np.sqrt(l1 * l2)  # PCA Area
+            
+    return out
+
+@numba.njit(fastmath=True)
+def _rolling_path_efficiency(x, y, w_frames):
+    """
+    Computes Path Efficiency Index (Feature 13).
+    Max distance from start / total path length.
+    """
+    n = len(x)
+    out = np.zeros(n, dtype=np.float32)
+    half_w = w_frames // 2
+    
+    for i in range(n):
+        start = max(0, i - half_w)
+        end = min(n, i + half_w + 1)
+        
+        if end - start < 2:
+            out[i] = 1.0
+            continue
+            
+        x0, y0 = x[start], y[start]
+        max_d = 0.0
+        path_len = 0.0
+        
+        for j in range(start + 1, end):
+            d = np.sqrt((x[j] - x0)**2 + (y[j] - y0)**2)
+            if d > max_d: 
+                max_d = d
+            path_len += np.sqrt((x[j] - x[j-1])**2 + (y[j] - y[j-1])**2)
+            
+        if path_len > 1e-6:
+            out[i] = max_d / path_len
+            
+    return out
+
+@numba.njit(fastmath=True)
+def _turn_event_kernel(x, y, amp, sign, bl, w_frames, thresh, min_sep):
+    """
+    Detects discrete turn/head-cast events (local maxima of `amp` above
+    `thresh`, separated by >= min_sep frames), then for each frame computes
+    centered-window stats over [i - w_frames//2, i + w_frames//2]:
+        col0: event count
+        col1: mean inter-event centroid distance, normalized by body length
+        col2: max  inter-event centroid distance, normalized by body length
+        col3: mean event amplitude
+        col4: coefficient of variation of inter-event TIME gaps (regularity)
+        col5: alternation score (fraction of consecutive event pairs with
+              opposite turn-direction sign)
+    """
+    n = len(x)
+    out = np.zeros((n, 6), dtype=np.float32)
+    half_w = w_frames // 2
+
+    events = np.zeros(n, dtype=np.uint8)
+    last_event = -min_sep - 1
+    for i in range(1, n - 1):
+        if amp[i] >= thresh and amp[i] >= amp[i - 1] and amp[i] >= amp[i + 1]:
+            if i - last_event >= min_sep:
+                events[i] = 1
+                last_event = i
+
+    idxs = np.empty(w_frames + 2, dtype=np.int64)
+    for i in range(n):
+        start = max(0, i - half_w)
+        end   = min(n, i + half_w + 1)
+
+        cnt = 0
+        for j in range(start, end):
+            if events[j] == 1:
+                idxs[cnt] = j
+                cnt += 1
+
+        out[i, 0] = cnt
+        if cnt == 1:
+            out[i, 3] = amp[idxs[0]]
+        elif cnt >= 2:
+            gap_sum = 0.0
+            gap_max = 0.0
+            amp_sum = amp[idxs[0]]
+            alt_count = 0
+            tg_sum = 0.0
+            tg_sq_sum = 0.0
+            for k in range(1, cnt):
+                amp_sum += amp[idxs[k]]
+                dx = x[idxs[k]] - x[idxs[k - 1]]
+                dy = y[idxs[k]] - y[idxs[k - 1]]
+                d = np.sqrt(dx * dx + dy * dy)
+                gap_sum += d
+                if d > gap_max:
+                    gap_max = d
+                tg = np.float64(idxs[k] - idxs[k - 1])
+                tg_sum += tg
+                tg_sq_sum += tg * tg
+                if sign[idxs[k]] * sign[idxs[k - 1]] < 0:
+                    alt_count += 1
+            n_gaps = cnt - 1
+            out[i, 1] = np.float32((gap_sum / n_gaps) / (bl + 1e-6))
+            out[i, 2] = np.float32(gap_max / (bl + 1e-6))
+            out[i, 3] = np.float32(amp_sum / cnt)
+            tg_mean = tg_sum / n_gaps
+            tg_var  = max(0.0, tg_sq_sum / n_gaps - tg_mean * tg_mean)
+            out[i, 4] = np.float32(np.sqrt(tg_var) / (tg_mean + 1e-6))
+            out[i, 5] = np.float32(alt_count / n_gaps)
+    return out
+
+
+def _turn_event_signals(df):
+    """Combined turn/head-cast amplitude + signed laterality, unit-matched."""
+    amp = np.maximum(
+        df["omega_heading"].to_numpy(dtype=np.float32),
+        np.radians(df["omega_relative"].to_numpy(dtype=np.float32)),  # deg/s -> rad/s
+    )
+    x0, y0   = df["xspine_0"].to_numpy(dtype=np.float32),  df["yspine_0"].to_numpy(dtype=np.float32)
+    x5, y5   = df["xspine_5"].to_numpy(dtype=np.float32),  df["yspine_5"].to_numpy(dtype=np.float32)
+    x10, y10 = df["xspine_10"].to_numpy(dtype=np.float32), df["yspine_10"].to_numpy(dtype=np.float32)
+    v1x, v1y = x0 - x5, y0 - y5
+    v2x, v2y = x10 - x5, y10 - y5
+    sign = np.sign(v1x * v2y - v1y * v2x).astype(np.float32)  # CW/CCW body-bend direction
+    return amp, sign
+
+
+def _turn_event_wrapper(df, w, fps, g_inst, groups_ser, stat_idx):
+    cache = df.attrs.setdefault("_turn_evt_cache", {})
+    if w not in cache:
+        w_frames = int(w * fps)
+        amp, sign = _turn_event_signals(df)
+        thresh  = np.float32(np.quantile(amp, CONFIG.get("turn_amp_quantile", 0.75)))
+        min_sep = max(1, int(CONFIG.get("turn_min_sep_sec", 0.5) * fps))
+
+        x_arr  = df["x"].to_numpy(dtype=np.float32)
+        y_arr  = df["y"].to_numpy(dtype=np.float32)
+        bl_arr = df["group_medians"].to_numpy(dtype=np.float32)
+
+        out = np.zeros((len(df), 6), dtype=np.float32)
+        for _, idx in g_inst.indices.items():
+            order = np.sort(idx)
+            out[order] = _turn_event_kernel(
+                x_arr[order], y_arr[order], amp[order], sign[order],
+                np.float32(bl_arr[order[0]]),
+                w_frames, thresh, min_sep,
+            )
+        cache[w] = out
+
+    return pd.Series(cache[w][:, stat_idx], index=df.index, dtype="float32")
+
+def _turn_event_count(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _turn_event_wrapper(df, w, fps,g_inst, groups_ser, 0)
+register("turn_event_count", version=1, fn=_turn_event_count)
+
+def _turn_event_gap_mean_bl(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _turn_event_wrapper(df, w, fps,g_inst, groups_ser, 1)
+register("turn_event_gap_mean_bl", version=1, fn=_turn_event_gap_mean_bl)
+
+def _turn_event_gap_max_bl(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _turn_event_wrapper(df, w, fps,g_inst, groups_ser, 2)
+register("turn_event_gap_max_bl", version=1, fn=_turn_event_gap_max_bl)
+
+def _turn_event_amp_mean(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _turn_event_wrapper(df, w, fps,g_inst, groups_ser, 3)
+register("turn_event_amp_mean", version=1, fn=_turn_event_amp_mean)
+
+def _turn_event_interval_cv(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _turn_event_wrapper(df, w, fps,g_inst, groups_ser, 4)
+register("turn_event_interval_cv", version=1, fn=_turn_event_interval_cv)
+
+def _turn_event_alternation(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _turn_event_wrapper(df, w, fps, g_inst,groups_ser, 5)
+register("turn_event_alternation", version=1, fn=_turn_event_alternation)
+
+
+def _revisit_series(group_df: pd.DataFrame, w: int) -> pd.Series:
+    arr = _revisit_numba(group_df["x"].values, group_df["y"].values, w)
+    return pd.Series(arr, index=group_df.index, dtype="float32")
+
+
 def get_windowed_freq(signal: np.ndarray, fps: float, window_seconds: float) -> np.ndarray:
     """Dominant frequency at each frame via STFT."""
     nperseg = int(window_seconds * fps)
@@ -283,7 +511,7 @@ register("rog", version=1, fn=_rog)
 
 
 def _tortuosity(df, feat, w, fps, g_inst, g_win, groups_ser):
-    half_w  = w // 2
+    half_w  = int(w * fps) // 2
     first_x = g_inst["x"].shift( half_w).fillna(df["x"])
     last_x  = g_inst["x"].shift(-half_w).fillna(df["x"])
     first_y = g_inst["y"].shift( half_w).fillna(df["y"])
@@ -293,11 +521,11 @@ def _tortuosity(df, feat, w, fps, g_inst, g_win, groups_ser):
     epsilon  = df["group_medians"] * 0.1
     return (path_len / (disp + epsilon)).astype("float32")
 
-register("tortuosity", version=1, fn=_tortuosity)
+register("tortuosity", version=2, fn=_tortuosity)
 
 
 def _msd(df, feat, w, fps, g_inst, g_win, groups_ser):
-    half_w  = w // 2
+    half_w  = int(w * fps) // 2
     first_x = g_inst["x"].shift( half_w).fillna(df["x"])
     last_x  = g_inst["x"].shift(-half_w).fillna(df["x"])
     first_y = g_inst["y"].shift( half_w).fillna(df["y"])
@@ -305,11 +533,11 @@ def _msd(df, feat, w, fps, g_inst, g_win, groups_ser):
     disp    = np.sqrt((last_x - first_x)**2 + (last_y - first_y)**2)
     return (disp**2 / w).astype("float32")
 
-register("msd", version=1, fn=_msd)
+register("msd", version=2, fn=_msd)
 
 
 def _msd_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
-    half_w  = w // 2
+    half_w  = int(w * fps) // 2
     first_x = g_inst["x"].shift( half_w).fillna(df["x"])
     last_x  = g_inst["x"].shift(-half_w).fillna(df["x"])
     first_y = g_inst["y"].shift( half_w).fillna(df["y"])
@@ -317,7 +545,7 @@ def _msd_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
     disp    = np.sqrt((last_x - first_x)**2 + (last_y - first_y)**2)
     return (disp**2 / (w * (df["group_medians"]**2) + 1e-6)).astype("float32")
 
-register("msd_norm", version=1, fn=_msd_norm)
+register("msd_norm", version=2, fn=_msd_norm)
 
 
 def _angular_tortuosity(df, feat, w, fps, g_inst, g_win, groups_ser):
@@ -451,26 +679,142 @@ register("reversal_rate", version=1, fn=_reversal_rate)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _revisitation_mean(df, feat, w, fps, g_inst, g_win, groups_ser):
-    tmp = _get_revisit_tmp(df, w, fps)
-    return (tmp["revisit_dist"].groupby(groups_ser).transform(lambda x: x.rolling(int(w * fps), min_periods=1).mean()).astype("float32"))
-
-register("revisitation_mean", version=2, fn=_revisitation_mean)
-
+    s = pd.Series(_revisit_stats_shared(df, w, g_inst), index=df.index)
+    return s.groupby(groups_ser).rolling(window=w, min_periods=1).mean() \
+            .reset_index(level=0, drop=True).astype("float32")
 
 def _revisitation_mean_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
-    tmp = _get_revisit_tmp(df, w, fps)
-    mean_dist = (tmp["revisit_dist"].groupby(groups_ser).transform(lambda x: x.rolling(int(w * fps), min_periods=1).mean()))
-    return (mean_dist / (df["group_medians"] + 1e-6)).astype("float32")
+    s = pd.Series(_revisit_stats_shared(df, w, g_inst), index=df.index)
+    rolled = s.groupby(groups_ser).rolling(window=w, min_periods=1).mean() \
+              .reset_index(level=0, drop=True)
+    return (rolled / (df["group_medians"] + 1e-6)).astype("float32")
 
+register("revisitation_mean", version=2, fn=_revisitation_mean)
 register("revisitation_mean_norm", version=2, fn=_revisitation_mean_norm)
 
+# windowed - other:
+def _path_length_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
+    path_len = _roll(g_win, "v_com", "sum") / fps
+    return (path_len / (df["group_medians"] + 1e-6)).astype("float32")
+register("path_length_norm", version=1, fn=_path_length_norm)
 
-def _revisitation_rate(df, feat, w, fps, g_inst, g_win, groups_ser):
-    tmp = _get_revisit_tmp(df, w, fps)
-    return (tmp["revisit_hit"].groupby(groups_ser).transform(lambda x: x.rolling(int(w * fps), min_periods=1).mean()).astype("float32"))
 
-register("revisitation_rate", version=1, fn=_revisitation_rate)
+def _head_bend_max(df, feat, w, fps, g_inst, g_win, groups_ser):
+    if "head_bend" not in df.columns:
+        v1x, v1y = df["xspine_2"] - df["xspine_0"], df["yspine_2"] - df["yspine_0"]
+        v2x, v2y = df["xspine_10"] - df["xspine_5"], df["yspine_10"] - df["yspine_5"]
+        df["head_bend"] = _angle_between_vectors(v1x, v1y, v2x, v2y).astype("float32")
+    return _roll_fresh(df, "head_bend", int(w * fps),"max")
+register("head_bend_max", version=1, fn=_head_bend_max)
 
+
+def _curvature_index_mean(df, feat, w, fps, g_inst, g_win, groups_ser):
+    if "curvature_index" not in df.columns:
+        chord = np.sqrt((df["xspine_10"] - df["xspine_0"])**2 + (df["yspine_10"] - df["yspine_0"])**2)
+        df["curvature_index"] = (df["body_len"] / (chord + 1e-6)).astype("float32")
+    return _roll_fresh(df, "curvature_index", int(w * fps),"mean")
+register("curvature_index_mean", version=1, fn=_curvature_index_mean)
+
+
+def _omega_heading_max(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _roll(g_win, "omega_heading", "max")
+register("omega_heading_max", version=1, fn=_omega_heading_max)
+
+
+def _pause_fraction(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _roll(g_win, "is_paused", "mean").fillna(0).astype("float32")
+register("pause_fraction", version=1, fn=_pause_fraction)
+
+def _posture_asymmetry_max(df, feat, w, fps, g_inst, g_win, groups_ser):
+    if "asym_norm" not in df.columns:
+        x0, y0 = df["xspine_0"], df["yspine_0"]
+        x5, y5 = df["xspine_5"], df["yspine_5"]
+        x10, y10 = df["xspine_10"], df["yspine_10"]
+        num = np.abs((x10 - x0)*(y0 - y5) - (x0 - x5)*(y10 - y0))
+        den = np.sqrt((x10 - x0)**2 + (y10 - y0)**2) + 1e-6
+        df["asym_norm"] = (num / den / (df["group_medians"] + 1e-6)).astype("float32")
+    return _roll_fresh(df, "asym_norm",int(w * fps), "max",)
+
+register("posture_asymmetry_max", version=1, fn=_posture_asymmetry_max)
+
+def _turn_fraction(df, feat, w, fps, g_inst, g_win, groups_ser):
+    if "is_turning" not in df.columns:
+        df["is_turning"] = (df["omega_heading"] > 0.35).astype("float32")
+    return _roll_fresh(df, "is_turning",int(w * fps), "mean")
+register("turn_fraction", version=1, fn=_turn_fraction)
+
+def _net_displacement_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
+    half_w  = int(w * fps) // 2
+    first_x = g_inst["x"].shift(half_w).fillna(df["x"])
+    last_x  = g_inst["x"].shift(-half_w).fillna(df["x"])
+    first_y = g_inst["y"].shift(half_w).fillna(df["y"])
+    last_y  = g_inst["y"].shift(-half_w).fillna(df["y"])
+    
+    disp = np.sqrt((last_x - first_x)**2 + (last_y - first_y)**2)
+    return (disp / (df["group_medians"] + 1e-6)).astype("float32")
+
+register("net_displacement_norm", version=2, fn=_net_displacement_norm)
+
+def _pca_stats_cached(df, w, fps, stat_idx):
+    cache = df.attrs.setdefault("_pca_cache", {})
+    if w not in cache:
+        w_frames = int(w * fps)
+        def _apply_pca(g):
+            arr = _rolling_pca_stats(g["x"].to_numpy(dtype=np.float32),
+                                      g["y"].to_numpy(dtype=np.float32), w_frames)
+            return pd.DataFrame(arr, index=g.index)
+        full = df.groupby(["source", "ID"], group_keys=False).apply(_apply_pca)
+        cache[w] = full.reindex(df.index).to_numpy(dtype=np.float32)
+    return pd.Series(cache[w][:, stat_idx], index=df.index, dtype="float32")
+
+def _pca_stats_wrapper(df, feat, w, fps, g_inst, g_win, groups_ser, stat_idx):
+    cache = df.attrs.setdefault("_pca_stats_cache", {})
+    if w not in cache:
+        w_frames = int(w * fps)
+        x_arr = df["x"].to_numpy(dtype=np.float32)
+        y_arr = df["y"].to_numpy(dtype=np.float32)
+        out = np.zeros((len(df), 2), dtype=np.float32)
+        for _, idx in g_inst.indices.items():
+            order = np.sort(idx)
+            out[order] = _rolling_pca_stats(x_arr[order], y_arr[order], w_frames)
+        cache[w] = out
+    return pd.Series(cache[w][:, stat_idx], index=df.index, dtype="float32")
+
+def _pca_ratio(df, feat, w, fps, g_inst, g_win, groups_ser):
+    return _pca_stats_wrapper(df, feat, w, fps, g_inst, g_win, groups_ser, stat_idx=0)
+
+def _pca_area_norm(df, feat, w, fps, g_inst, g_win, groups_ser):
+    area = _pca_stats_wrapper(df, feat, w, fps, g_inst, g_win, groups_ser, stat_idx=1)
+    return (area / (df["group_medians"]**2 + 1e-6)).astype("float32")
+
+register("pca_ratio", version=2, fn=_pca_ratio)
+register("pca_area_norm", version=2, fn=_pca_area_norm)
+
+def _vel_autocorr(df, feat, w, fps, g_inst, g_win, groups_ser):
+    if "autocorr_1s" not in df.columns:
+        lag = int(fps)
+        dx, dy = g_inst["x"].diff(), g_inst["y"].diff()
+        dx_lag, dy_lag = g_inst["x"].diff().shift(lag), g_inst["y"].diff().shift(lag)
+        dot = (dx * dx_lag) + (dy * dy_lag)
+        mag = (dx**2 + dy**2) * (dx_lag**2 + dy_lag**2)
+        df["autocorr_1s"] = (dot / (np.sqrt(mag) + 1e-6)).fillna(0).astype("float32")
+    return _roll_fresh(df, "autocorr_1s",int(w * fps), "mean")
+
+register("vel_autocorr", version=1, fn=_vel_autocorr)
+
+def _path_efficiency(df, feat, w, fps, g_inst, g_win, groups_ser):
+    cache = df.attrs.setdefault("_path_eff_cache", {})
+    if w not in cache:
+        w_frames = int(w * fps)
+        x_arr = df["x"].to_numpy(dtype=np.float32)
+        y_arr = df["y"].to_numpy(dtype=np.float32)
+        out = np.zeros(len(df), dtype=np.float32)
+        for _, idx in g_inst.indices.items():
+            order = np.sort(idx)
+            out[order] = _rolling_path_efficiency(x_arr[order], y_arr[order], w_frames)
+        cache[w] = out
+    return pd.Series(cache[w], index=df.index, dtype="float32")
+register("path_efficiency", version=2, fn=_path_efficiency)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Windowed features — slope / trend  (depend on other windowed features)
@@ -515,10 +859,6 @@ register(
     prereqs=["tortuosity"],
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Orchestrator  — replaces calculate() in exp_feature_calculation.py
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _build_base_signals(df: pd.DataFrame, fps: float, pause_threshold: float) -> None:
     """
@@ -700,23 +1040,18 @@ def calculate_columns(
     if not wanted:
         return pd.DataFrame(index=df.index)
 
-    # ── Build base signals once ───────────────────────────────────────────────
     _build_base_signals(df, fps, pause_threshold)
     groups_ser = df["source"] + "_" + df["ID"].astype(str)
     feat_out   = pd.DataFrame(index=df.index)
 
-    # ── Base (non-windowed) features ─────────────────────────────────────────
     if None in wanted:
         g_inst = df.groupby(["source", "ID"])
         for feat_name in wanted[None]:
             fdef = _REGISTRY[feat_name]
             feat_out[feat_name] = fdef.fn(df, feat_out, fps, g_inst)
 
-    # ── Per-window targeted pass ──────────────────────────────────────────────
-    # List to collect our dataframes before doing ONE final concat
     collected_frames = [feat_out]
 
-    # ── Per-window targeted pass ──────────────────────────────────────────────
     for w, feat_names_wanted in wanted.items():
         if w is None:
             continue
@@ -724,7 +1059,6 @@ def calculate_columns(
         g_inst = df.groupby(["source", "ID"])
         g_win  = g_inst.rolling(window=int(w * fps), min_periods=1, center=True)
 
-        # Collect the wanted features + all their transitive prereqs (for this window)
         def _collect_with_prereqs(name: str, seen: set) -> List[str]:
             if name in seen:
                 return []
@@ -743,15 +1077,18 @@ def calculate_columns(
         for name in feat_names_wanted:
             run_order.extend(_collect_with_prereqs(name, seen))
 
-        # Topo-sort to respect intra-window prereqs
         applicable = [_REGISTRY[n] for n in run_order if n in _REGISTRY and not _REGISTRY[n].is_base]
         applicable = _topo_sort_features(applicable)
 
-        feat_win = pd.DataFrame(index=df.index)   # scratch for this window (includes prereqs)
+        feat_win = pd.DataFrame(index=df.index)   
         for fdef in applicable:
             col = f"w{w}_{fdef.name}"
+            t0 = time.perf_counter()
             feat_win[col] = fdef.fn(df, feat_win, w, fps, g_inst, g_win, groups_ser)
-
+            dt = time.perf_counter() - t0
+            if dt > 5.0:
+                print(f"    SLOW: {col} took {dt:.1f}s")
+        
         cols_to_keep = [f"w{w}_{feat_name}" for feat_name in feat_names_wanted]
         cols_to_keep = [c for c in cols_to_keep if c in feat_win.columns]
         
@@ -762,11 +1099,11 @@ def calculate_columns(
         del g_inst, g_win, feat_win
         gc.collect()
 
+    # Strip the index from the base features frame too
     collected_frames[0].reset_index(drop=True, inplace=True)
     
     final_out = pd.concat(collected_frames, axis=1)
     
-    # Restore the original dataframe index
     final_out.index = df.index
 
     return final_out.astype("float32").copy()
