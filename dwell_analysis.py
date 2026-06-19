@@ -911,3 +911,30 @@ def delta_dir_closer_distance_histogram(data: pd.DataFrame, plot_dir, odor="righ
     
     fig.savefig(path / "Closed_Loop_Steering_vs_Distance_Fixed.png", bbox_inches="tight", dpi=300)
     plt.close(fig)
+
+
+#USAGE:
+
+# from pathlib import Path
+# import dwell_analysis as da
+# import pandas as pd
+
+# PREDICTIONS_PATH = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\exported_models\RUN_exp_feature_calculation_20260608_160752_train-GA1-GA3-GA2-EA-H2O_test-GA1-GA3-GA2-EA-H2O\predictions\MF3_TH0.6_GC5.5_GO15_predictions.csv")
+# FEATURE_PATH = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\exported_models\master_feature_cache") # probably don't need this
+# RAW_DATA = Path(r"C:\Users\corna\honours\fresh1\hp_2\data_intermediate\raw_trajectories.parquet")
+# PLOT_DIR = Path(r"C:\Users\corna\honours\fresh1\hp_2\notebooks\parquet_pipeline\analysis\plots")
+
+# sources = ["GA1","GA2","GA3","EA","H2O"]
+# required_cols = [
+#     "source", "ID", "et", "x", "y",
+#     *(f"xspine_{i}" for i in range(11)),
+#     *(f"yspine_{i}" for i in range(11)),
+# ]
+# extra_cols = None
+
+# preds = pd.read_csv(PREDICTIONS_PATH)
+# coords = da.get_coords(RAW_DATA,required_cols,extra_cols,sources)
+# data = da.merge(coords,preds)
+
+#then run whatever plots you want!: ie
+#da.dwell_proportion_total(data,PLOT_DIR)
