@@ -38,12 +38,18 @@ import feature_store as fs
 from feature_store import FeatureSetConfig, _parquet_path, _KEY_COLS
 
 from scipy.ndimage import binary_closing, binary_opening, median_filter
+from scipy.stats import spearmanr
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import squareform
+from sklearn.inspection import permutation_importance
 from dataclasses import dataclass
 
 import pyarrow.parquet as pq
 
 import numpy as np
 from scipy.ndimage import label, binary_dilation
+
+import shap
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -113,6 +119,49 @@ def plot_gini(names, imp, output_dir, num=None):
     print(f"Feature Importances plotted → {ppath}")
     return ranked_features
 
+def plot_shap(model, X_df, output_dir, subsample_size=10000):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[SHAP] Calculating SHAP values (subsampling {subsample_size} rows for speed)...")
+    
+    if len(X_df) > subsample_size:
+        X_sample = X_df.sample(n=subsample_size, random_state=42)
+    else:
+        X_sample = X_df
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_sample)
+
+    # Scikit-Learn RF outputs a list of shap arrays [Negative Class, Positive Class]
+    if isinstance(shap_values, list):
+        shap_vals_dwelling = shap_values[1]
+    elif len(shap_values.shape) == 3:
+        shap_vals_dwelling = shap_values[:, :, 1]
+    else:
+        shap_vals_dwelling = shap_values
+
+    # 1. Beeswarm Summary Plot (Feature impact distribution)
+    fig, ax = plt.subplots(figsize=(70, 6))
+    shap.summary_plot(shap_vals_dwelling, X_sample, show=False,max_display = 70)
+    plt.title("SHAP Summary (Impact on 'Dwelling')")
+    plt.tight_layout()
+    summary_path = output_dir / "shap_summary_beeswarm.png"
+    fig.savefig(summary_path, bbox_inches="tight", dpi=300, facecolor='white')
+    plt.close(fig)
+
+    # 2. Global Bar Plot (The SHAP equivalent of your Gini plot)
+    fig, ax = plt.subplots(figsize=(70, 6))
+    shap.summary_plot(shap_vals_dwelling, X_sample, plot_type="bar", show=False,max_display = 70)
+    plt.title("SHAP Feature Importance (Mean |SHAP|)")
+    plt.tight_layout()
+    bar_path = output_dir / "shap_importance_bar.png"
+    fig.savefig(bar_path, bbox_inches="tight", dpi=300, facecolor='white')
+    plt.close(fig)
+
+    print(f"[SHAP] Beeswarm plotted → {summary_path}")
+    print(f"[SHAP] Bar plot plotted  → {bar_path}")
+
 @dataclass
 class PostProcessConfig:
     median_filter: float = 5.166667
@@ -149,7 +198,8 @@ def train(
     cache_dir,
     fsc: FeatureSetConfig,
     train_keys=None,
-    do_plot_gini=False,
+    do_plot_gini=False,do_plot_shap=False,shap_subsample=10000,
+    do_spearman_clustering=False, spearman_corr_threshold=0.8, enact_clustering = False,
     plot_path=None,
     n_est=300,max_dep=16,max_feat=0.3,min_samples=100,min_split=2,
 ):
@@ -243,6 +293,96 @@ def train(
 
     print(f"[train] Training on {len(X_train):,} rows "
           f"({y.sum()} dwelling / {(1-y).sum()} nondwelling)")
+    
+    
+    if do_spearman_clustering:
+        print(f"\n[train] Executing Spearman hierarchical clustering (Cutoff |ρ| ≥ {spearman_corr_threshold})...")
+        
+        # 1. Compute absolute Spearman distance matrix: d(x,y) = 1 - |ρ|
+        corr_matrix = X_train.corr(method='spearman').fillna(0).values
+        dist_matrix = 1.0 - np.abs(corr_matrix)
+        
+        # Guard against float64 floating-point errors (e.g. 1e-16 instead of 0.0) crashing SciPy
+        dist_matrix = (dist_matrix + dist_matrix.T) / 2.0 
+        np.fill_diagonal(dist_matrix, 0.0)
+        
+        condensed_dist = squareform(dist_matrix, checks=False)
+        linkage_matrix = hierarchy.linkage(condensed_dist, method='average')
+        
+        dist_threshold = 1.0 - spearman_corr_threshold
+        cluster_labels = hierarchy.fcluster(linkage_matrix, dist_threshold, criterion='distance')
+        
+        # 2. Pick the representative feature per cluster most strongly correlated to target `y`
+        corrs_with_y = np.abs(X_train.apply(lambda col: spearmanr(col, y)[0]).fillna(0).values)
+        
+        kept_features = []
+        pruning_log = []
+        
+        for cid in np.unique(cluster_labels):
+            c_indices = np.where(cluster_labels == cid)[0]
+            if len(c_indices) == 1:
+                kept_features.append(feature_cols[c_indices[0]])
+            else:
+                best_sub_idx = c_indices[np.argmax(corrs_with_y[c_indices])]
+                best_feat = feature_cols[best_sub_idx]
+                kept_features.append(best_feat)
+                
+                dropped = [feature_cols[i] for i in c_indices if i != best_sub_idx]
+                pruning_log.append((best_feat, dropped))
+                
+        print(f"[train] Pruned {len(feature_cols) - len(kept_features)} collinear features. {len(kept_features)} survive.")
+        
+        # 3. Create Dendrogram Plot
+        p_dir = Path(plot_path) if plot_path else Path(model_path).parent
+        p_dir.mkdir(parents=True, exist_ok=True)
+        
+        fig, ax = plt.subplots(figsize=(14, 8))
+        hierarchy.dendrogram(
+            linkage_matrix, labels=feature_cols, ax=ax, leaf_rotation=90, 
+            leaf_font_size=8, color_threshold=dist_threshold
+        )
+        ax.axhline(y=dist_threshold, color='r', linestyle='--', label=f'Cut Threshold (Dist ≤ {dist_threshold:.2f})')
+        ax.set_title(f"Spearman Collinearity Dendrogram (Kept {len(kept_features)} of {len(feature_cols)} features)")
+        ax.set_ylabel("Distance: 1.0 - |Spearman ρ|")
+        ax.legend()
+        plt.tight_layout()
+        dendro_path = p_dir / "spearman_clustering_dendrogram.png"
+        fig.savefig(dendro_path, dpi=300, facecolor='white')
+        plt.close(fig)
+        
+        # 4. Write exhaustive log to the report text file
+        report_file = p_dir / "spearman_feature_selection_report.txt"
+        with open(report_file, "w") as rf:
+            rf.write(f"=== SPEARMAN RANK-ORDER CLUSTERING SELECTION REPORT ===\n")
+            rf.write(f"Correlation Cutoff Threshold : |rho| >= {spearman_corr_threshold}  (Distance <= {dist_threshold:.2f})\n")
+            rf.write(f"Original Feature Count       : {len(feature_cols)}\n")
+            rf.write(f"Surviving Feature Count      : {len(kept_features)}\n")
+            rf.write(f"Eliminated Feature Count     : {len(feature_cols) - len(kept_features)}\n\n")
+            rf.write("SURVIVING REPRESENTATIVES (Passed to Model):\n")
+            rf.write(", ".join(kept_features) + "\n\n")
+            if pruning_log:
+                rf.write("PRUNING REPLACEMENT MAP (Surviving Representative  <===  [Eliminated Collinear Features]):\n")
+                for rep, drops in pruning_log:
+                    rf.write(f" • [KEPT] {rep:<25} <=== replaced: {', '.join(drops)}\n")
+        
+        print(f"[train] Dendrogram saved → {dendro_path}")
+        print(f"[train] Text report saved → {report_file}")
+        
+        if enact_clustering:
+            feature_cols = kept_features
+            X_train = X_train[feature_cols]
+            
+            surv_base = [c for c in feature_cols if not c.startswith("w")]
+            surv_win = {}
+            for c in feature_cols:
+                if c.startswith("w") and "_" in c:
+                    try:
+                        w_val = int(c.split("_")[0][1:])
+                        feat_name = "_".join(c.split("_")[1:])
+                        surv_win.setdefault(feat_name, []).append(w_val)
+                    except ValueError: pass
+                    
+            fsc = FeatureSetConfig(name=f"{fsc.name}_spearman_pruned", base_features=surv_base, windowed_features=surv_win)
 
     # ── Fit model ─────────────────────────────────────────────────────────────
     model = RandomForestClassifier(
@@ -269,6 +409,12 @@ def train(
         with open(plot_path / "feature_ranking.txt", "w") as f:
             for feat in ranked_features:
                 f.write(feat + "\n")
+                
+    if do_plot_shap:
+        if plot_path is None:
+            print("⚠ WARNING: do_plot_shap is True, but plot_path is None. Skipping SHAP.")
+        else:
+            plot_shap(model, X_train, plot_path, subsample_size=shap_subsample)
     
     
     # ── Persist ───────────────────────────────────────────────────────────────
@@ -871,7 +1017,137 @@ def get_event_info(preds_dir, val_dir, ppc,report_path,dwell_tags=("wonderful",)
     with open(report_path, "a") as f:
         f.write("\n".join(report_lines) + "\n")
         
+def evaluate_validation_permutation_importance(
+    model_path,
+    ctx,
+    val_prefixes,
+    logic_file,
+    feature_path,
+    cache_dir,
+    val_keys,
+    report_path,
+    plots_dir,
+    n_repeats=10,
+    seed=42,
+):
+    """
+    Evaluates unbiased Scikit-Learn Permutation Importance strictly over the validation split.
+    Outputs weights to report and isolates pure noise (Importance_Mean <= 0).
+    """
+    cache_dir, plots_dir, report_path = Path(cache_dir), Path(plots_dir), Path(report_path)
+    plots_dir.mkdir(parents=True, exist_ok=True)
     
+    model = load_model(model_path)
+    
+    # Re-hydrate the FSC saved at training time
+    fsc = joblib.load(feature_path)
+    if not isinstance(fsc, FeatureSetConfig):
+        cols = fsc
+        fsc = FeatureSetConfig(name="legacy", base_features=[c for c in cols if not c.startswith("w")], windowed_features={})
+        for c in cols:
+            if c.startswith("w") and "_" in c:
+                try: fsc.windowed_features.setdefault("_".join(c.split("_")[1:]), []).append(int(c.split("_")[0][1:]))
+                except ValueError: pass
+
+    feature_cols = fsc.get_all_columns()
+    print(f"\n[Permutation Importance] Reconstructing validation set for {len(feature_cols)} features...")
+    
+    # 1. Gather cached feature data for validation prefixes
+    X_list, meta_list = [], []
+    for src in val_prefixes:
+        try:
+            X_src, meta_src = fs._load_features_for_sources(cache_dir, [src], fsc)
+            X_list.append(X_src)
+            meta_list.append(meta_src)
+        except FileNotFoundError: continue
+            
+    if not X_list:
+        raise RuntimeError("No cached features found for requested validation sources.")
+
+    meta = pd.concat(meta_list, ignore_index=True)
+    X_raw = pd.concat(X_list, ignore_index=True)
+
+    # 2. Slice strictly to validation larvae
+    vk = val_keys.copy()
+    vk["source"], vk["ID"] = vk["source"].astype(str), vk["ID"].astype(str)
+    meta["source"], meta["ID"] = meta["source"].astype(str), meta["ID"].astype(str)
+    meta["et"] = meta["et"].astype("float32").round(4)
+    
+    meta["_row_idx"] = np.arange(len(meta))
+    meta_filtered = meta.merge(vk, on=["source", "ID"], how="inner")
+    
+    if meta_filtered.empty:
+        raise RuntimeError("No validation larvae matched the feature rows.")
+
+    X_val = X_raw.iloc[meta_filtered["_row_idx"]].reset_index(drop=True)
+    del X_raw; gc.collect()
+    
+    meta_filtered = meta_filtered.drop(columns=["_row_idx"]).reset_index(drop=True)
+
+    # 3. Join ground truth targets
+    ann = ctx.annotated[["source", "ID", "et", "behavior"]].copy()
+    ann["source"], ann["ID"] = ann["source"].astype(str), ann["ID"].astype(str)
+    ann["et"] = ann["et"].astype("float32").round(4)
+
+    meta_with_features = meta_filtered.join(X_val)
+    combined = meta_with_features.merge(ann, on=["source", "ID", "et"], how="inner")
+    combined = combined[combined["behavior"].isin(["dwelling", "nondwelling"])].reset_index(drop=True)
+    
+    y_val = (combined["behavior"] == "dwelling").astype(np.int32)
+    X_val_final = combined[feature_cols].astype("float32")
+
+    print(f"[Permutation Importance] Shuffling {len(X_val_final):,} validation rows ({n_repeats} passes per feature)...")
+    
+    # 4. Execute Scikit-Learn Permutation
+    pi = permutation_importance(
+        model, X_val_final.values, y_val.values,
+        n_repeats=n_repeats, random_state=seed, n_jobs=-1, scoring='balanced_accuracy'
+    )
+
+    df_imp = pd.DataFrame({
+        "feature": feature_cols,
+        "importance_mean": pi.importances_mean,
+        "importance_std": pi.importances_std
+    }).sort_values(by="importance_mean", ascending=False)
+
+    noise_df = df_imp[df_imp["importance_mean"] <= 0.0]
+
+    # 5. Append findings to the main assessment report text file
+    with open(report_path, "a") as f:
+        f.write(f"\n\n{'='*50}\nUNBIASED VALIDATION PERMUTATION IMPORTANCE\n{'='*50}\n")
+        f.write(f"Evaluated on {len(X_val_final):,} validation rows. Scorer: Balanced Accuracy.\n\n")
+        f.write("TOP 15 HIGHEST IMPACT VALIDATION FEATURES:\n")
+        for _, r in df_imp.head(15).iterrows():
+            f.write(f" • {r['feature']:<28} mean: {r['importance_mean']:+.4f}  (±{r['importance_std']:.4f})\n")
+            
+        f.write(f"\n### ZERO OR NEGATIVE IMPORTANCE FEATURES (PURE NOISE) [{len(noise_df)} total] ###\n")
+        f.write("A <= 0 indicates scrambling the feature caused validation accuracy to stay flat or IMPROVE.\n")
+        if noise_df.empty:
+            f.write(" ✓ Zero noise features detected. All model inputs contributed positively.\n")
+        else:
+            for _, r in noise_df.iterrows():
+                f.write(f" X [NOISE] {r['feature']:<26} mean: {r['importance_mean']:+.5f}  (±{r['importance_std']:.5f})\n")
+
+    # 6. Generate Plot (Color-coded: Blue = Signal, Red = Noise)
+    top_pos = df_imp[df_imp["importance_mean"] > 0].head(25)
+    plot_df = pd.concat([top_pos, noise_df]).drop_duplicates().sort_values(by="importance_mean", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(plot_df) * 0.3)))
+    colors = ['#ef4444' if val <= 0 else '#3b82f6' for val in plot_df["importance_mean"]]
+    
+    ax.barh(plot_df["feature"], plot_df["importance_mean"], xerr=plot_df["importance_std"], color=colors, alpha=0.85, capsize=3)
+    ax.axvline(0, color='black', linewidth=1.2, linestyle='--')
+    ax.set_xlabel("Mean Decrease in Validation Balanced Accuracy")
+    ax.set_title("Validation Permutation Importance (Red bars = Pure Noise)")
+    ax.grid(axis='x', linestyle=':', alpha=0.6)
+    
+    plot_file = plots_dir / "validation_permutation_importance.png"
+    fig.savefig(plot_file, bbox_inches="tight", dpi=300, facecolor='white')
+    plt.close(fig)
+
+    print(f"[Permutation Importance] Saved plot   → {plot_file}")
+    print(f"[Permutation Importance] Logged to    → {report_path}")
+    return df_imp, noise_df
 
 # ─────────────────────────────────────────────────────────────────────────────
 # assess_performance()  — logic unchanged, signature unchanged
