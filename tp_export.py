@@ -37,7 +37,7 @@ from scikitplot.metrics import plot_cumulative_gain, plot_lift_curve
 import feature_store as fs
 from feature_store import FeatureSetConfig, _parquet_path, _KEY_COLS
 
-from scipy.ndimage import binary_closing, binary_opening, median_filter
+from scipy.ndimage import binary_closing, binary_opening, median_filter, label
 from scipy.stats import spearmanr
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
@@ -62,7 +62,6 @@ def load_model(model_path):
     model = joblib.load(model_path)
     print(f"Model loaded from {model_path}")
     return model
-
 
 def _fsc_from_path_or_obj(fsc_or_path) -> FeatureSetConfig:
     """Accept a FeatureSetConfig object or a path to a saved .json."""
@@ -119,7 +118,7 @@ def plot_gini(names, imp, output_dir, num=None):
     print(f"Feature Importances plotted → {ppath}")
     return ranked_features
 
-def plot_shap(model, X_df, output_dir, subsample_size=10000):
+def plot_shap(model, X_df, output_dir, subsample_size=10000, save_plots=True):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,26 +140,42 @@ def plot_shap(model, X_df, output_dir, subsample_size=10000):
     else:
         shap_vals_dwelling = shap_values
 
-    # 1. Beeswarm Summary Plot (Feature impact distribution)
-    fig, ax = plt.subplots(figsize=(70, 6))
-    shap.summary_plot(shap_vals_dwelling, X_sample, show=False,max_display = 70)
-    plt.title("SHAP Summary (Impact on 'Dwelling')")
-    plt.tight_layout()
-    summary_path = output_dir / "shap_summary_beeswarm.png"
-    fig.savefig(summary_path, bbox_inches="tight", dpi=300, facecolor='white')
-    plt.close(fig)
+    # Mean absolute SHAP importance
+    mean_abs_shap = np.abs(shap_vals_dwelling).mean(axis=0)
 
-    # 2. Global Bar Plot (The SHAP equivalent of your Gini plot)
-    fig, ax = plt.subplots(figsize=(70, 6))
-    shap.summary_plot(shap_vals_dwelling, X_sample, plot_type="bar", show=False,max_display = 70)
-    plt.title("SHAP Feature Importance (Mean |SHAP|)")
-    plt.tight_layout()
-    bar_path = output_dir / "shap_importance_bar.png"
-    fig.savefig(bar_path, bbox_inches="tight", dpi=300, facecolor='white')
-    plt.close(fig)
+    shap_df = pd.DataFrame({
+        "feature": X_sample.columns,
+        "mean_abs_shap": mean_abs_shap
+    }).sort_values("mean_abs_shap", ascending=False)
 
-    print(f"[SHAP] Beeswarm plotted → {summary_path}")
-    print(f"[SHAP] Bar plot plotted  → {bar_path}")
+    shap_csv_path = output_dir / "shap_scores.csv"
+    shap_df.to_csv(shap_csv_path, index=False)
+
+    print(f"[SHAP] Scores saved     → {shap_csv_path}")
+
+    if save_plots:
+        # 1. Beeswarm Summary Plot (Feature impact distribution)
+        fig, ax = plt.subplots(figsize=(70, 6))
+        shap.summary_plot(shap_vals_dwelling, X_sample, show=False,max_display = 70)
+        plt.title("SHAP Summary (Impact on 'Dwelling')")
+        plt.tight_layout()
+        summary_path = output_dir / "shap_summary_beeswarm.png"
+        fig.savefig(summary_path, bbox_inches="tight", dpi=300, facecolor='white')
+        plt.close(fig)
+
+        # 2. Global Bar Plot (The SHAP equivalent of your Gini plot)
+        fig, ax = plt.subplots(figsize=(70, 6))
+        shap.summary_plot(shap_vals_dwelling, X_sample, plot_type="bar", show=False,max_display = 70)
+        plt.title("SHAP Feature Importance (Mean |SHAP|)")
+        plt.tight_layout()
+        bar_path = output_dir / "shap_importance_bar.png"
+        fig.savefig(bar_path, bbox_inches="tight", dpi=300, facecolor='white')
+        plt.close(fig)
+
+        print(f"[SHAP] Beeswarm plotted → {summary_path}")
+        print(f"[SHAP] Bar plot plotted  → {bar_path}")
+
+    return shap_df
 
 @dataclass
 class PostProcessConfig:
@@ -168,16 +183,28 @@ class PostProcessConfig:
     threshold: float = 0.5
     gap_fill_size: float = 5.5
     minimum_dwell_length: float = 4.5
+
     def predict(self, probs):
         smoothed = median_filter(probs, size=int(self.median_filter * 6))
         preds    = (smoothed > self.threshold).astype(int)
+        
         close_sz = int(self.gap_fill_size * 6)
         open_sz  = int(self.minimum_dwell_length * 6)
         pad      = max(close_sz, open_sz)
+
         preds_p  = np.pad(preds, pad, mode="edge")
         preds_p  = binary_closing(preds_p, structure=np.ones(close_sz)).astype(int)
         preds_p  = binary_opening(preds_p, structure=np.ones(open_sz)).astype(int)
-        return preds_p[pad:-pad]
+        preds = preds_p[pad:-pad]
+
+        # remove any remaining edge dwell bouts shorter than minimum_dwell_length
+        labels, n_labels = label(preds)
+        for i in range(1, n_labels + 1):
+            run = (labels == i)
+            if run.sum() < open_sz:
+                preds[run] = 0
+        return preds
+    
     def get_IDstr(self):
         return f"MF{self.median_filter}_TH{self.threshold}_GC{self.gap_fill_size}_GO{self.minimum_dwell_length}"
 
@@ -198,7 +225,7 @@ def train(
     cache_dir,
     fsc: FeatureSetConfig,
     train_keys=None,
-    do_plot_gini=False,do_plot_shap=False,shap_subsample=10000,
+    do_plot_gini=False,do_plot_shap=False,shap_subsample=10000,save_shap_plots=True,
     do_spearman_clustering=False, spearman_corr_threshold=0.8, enact_clustering = False,
     plot_path=None,
     n_est=300,max_dep=16,max_feat=0.3,min_samples=100,min_split=2,
@@ -259,7 +286,7 @@ def train(
     ann = ctx.annotated[["source", "ID", "et", "behavior", "tags"]].copy()
     ann["source"] = ann["source"].astype(str)
     ann["ID"]     = ann["ID"].astype(str)
-    ann["et"]     = ann["et"].astype("float32").round(4)
+    ann["et"]  = (ann["et"]  * 10_000).round().astype("int32")
 
     if train_keys is not None:
         print("[train] Pre-filtering annotation table to train-split larvae …")
@@ -270,10 +297,10 @@ def train(
         ann = ann.merge(train_keys_copy, on=["source", "ID"], how="inner")
         print(f"[train] Annotations restricted: {n_ann_before} → {len(ann)} rows "
               f"({ann[['source','ID']].drop_duplicates().shape[0]} larvae)")
-
+    
     meta["source"] = meta["source"].astype(str)
     meta["ID"]     = meta["ID"].astype(str)
-    meta["et"]     = meta["et"].astype("float32").round(4)
+    meta["et"] = (meta["et"] * 10_000).round().astype("int32")
 
     combined = meta.join(X)
     combined = combined.merge(ann, on=["source", "ID", "et"], how="left")
@@ -293,8 +320,7 @@ def train(
 
     print(f"[train] Training on {len(X_train):,} rows "
           f"({y.sum()} dwelling / {(1-y).sum()} nondwelling)")
-    
-    
+
     if do_spearman_clustering:
         print(f"\n[train] Executing Spearman hierarchical clustering (Cutoff |ρ| ≥ {spearman_corr_threshold})...")
         
@@ -409,13 +435,12 @@ def train(
         with open(plot_path / "feature_ranking.txt", "w") as f:
             for feat in ranked_features:
                 f.write(feat + "\n")
-                
+    
     if do_plot_shap:
         if plot_path is None:
             print("⚠ WARNING: do_plot_shap is True, but plot_path is None. Skipping SHAP.")
         else:
-            plot_shap(model, X_train, plot_path, subsample_size=shap_subsample)
-    
+            shap_df = plot_shap(model, X_train, plot_path, subsample_size=shap_subsample, save_plots=save_shap_plots)
     
     # ── Persist ───────────────────────────────────────────────────────────────
     joblib.dump(model,  model_path);   print(f"Model saved      → {model_path}")
@@ -639,6 +664,7 @@ def predict(probabilities_path, ppc, predictions_dir, ctx, logic_file, plot=Fals
             print(f"Predicting for {source} track {track_id_str}…")
 
         track_data  = df_probs.loc[(source, track_id_str)].sort_values("et")
+        
         probs_array = track_data["prob"].values
         binary_preds = ppc.predict(probs_array)
 
@@ -673,7 +699,7 @@ def predict(probabilities_path, ppc, predictions_dir, ctx, logic_file, plot=Fals
 # plot_source_grid()  — unchanged from original
 # ─────────────────────────────────────────────────────────────────────────────
 
-def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5, safe_zone_size=30):
+def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5, safe_zone_size=30, grace_zone_size = 9):
         """
         Computes event-based TP, FP, FN using a safe-zone (tolerance margin) approach.
         safe_zone_size: Number of frames (y time points) to extend before and after a GT event.
@@ -727,8 +753,8 @@ def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5, safe_
                         fn_mask[idx_seg[gt_mask]] = True
                 
                 # ---------------------------------------------------------
-                # RULE 2: The Safe Zone
-                # "for each dwelling interval, there is a safe zone of y time points around it, 
+                # RULE 2a: Dwelling Safe Zone
+                # "for each dwelling interval, there is a safe zone of y time points outside of it, 
                 # also including the gt dwell event itself."
                 # ---------------------------------------------------------
                 if safe_zone_size > 0:
@@ -737,6 +763,30 @@ def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5, safe_
                     safe_zone_mask = binary_dilation(yt_seg > 0, structure=structure)
                 else:
                     safe_zone_mask = (yt_seg > 0)
+
+                # ---------------------------------------------------------
+                # RULE 2B: Nondwelling Edge Grace Zone
+                # "Allow predictions to bleed <=y time points into a GT nondwell
+                # at the beginning and end of a nondwell interval. (i.e. grace zone within GT nondwell)"
+                # ---------------------------------------------------------
+                nd_labels, num_nd = label(yt_seg == 0)
+                nd_grace_mask = np.zeros_like(yt_seg, dtype=bool)
+
+                for nd_idx in range(1, num_nd + 1):
+                    nd_mask = (nd_labels == nd_idx)
+                    nd_inds = np.where(nd_mask)[0]
+
+                    if len(nd_inds) == 0:
+                        continue
+
+                    start = nd_inds[0]
+                    end   = nd_inds[-1]
+
+                    nd_grace_mask[start : min(start + grace_zone_size, len(yt_seg))] = True
+                    nd_grace_mask[max(end - grace_zone_size + 1, 0) : end + 1] = True
+
+                # Combine both rule 2a and 2b safe regions
+                safe_zone_mask = safe_zone_mask | nd_grace_mask
                     
                 # ---------------------------------------------------------
                 # RULE 3: False Positives
@@ -754,7 +804,7 @@ def event_confusion_matrix(y_true, y_pred, meta_df, overlap_threshold=0.5, safe_
                 
         return tp, fp, fn, tp_mask,fp_mask,fn_mask,safe_frames_global
 
-def plot_source_grid(results_path, src, out_dir, ppc, val_keys,cols=10,rows=None,dwell_tags=["wonderful"]):
+def plot_source_grid(results_path, src, out_dir, ppc, val_keys,cols=10,rows=None,dwell_tags=["wonderful"],start_id=None):
     """One figure per source — all larvae as a grid of small prob traces."""
     ppc_id    = ppc.get_IDstr()
     pred_path = results_path / f"{ppc_id}_predictions.csv"
@@ -779,7 +829,16 @@ def plot_source_grid(results_path, src, out_dir, ppc, val_keys,cols=10,rows=None
 
     plt.style.use("default")
     grp_src = results[results["source"] == src]
-    larvae  = sorted(grp_src["ID"].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
+    larvae = sorted(grp_src["ID"].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
+
+    if start_id is not None:
+        start_id = str(start_id)
+
+        if start_id in larvae:
+            start_idx = larvae.index(start_id)
+            larvae = larvae[start_idx:]
+        else:
+            print(f"Warning: start_id {start_id} not found in source {src}")
 
     if len(larvae) == 0:
         print(f"  No tracks found for source {src}. Skipping plot.")
@@ -840,15 +899,33 @@ def plot_source_grid(results_path, src, out_dir, ppc, val_keys,cols=10,rows=None
             if val_keys is not None:
                 is_val = ((val_keys["source"].astype(str) == str(src)) & (val_keys["ID"].astype(str) == str(lid))).any()
 
-            # Local Evaluation logic for the grid visual
+            # Local Evaluation logic for the grid visual - dwelling safe zone
             safe_zone_size = 30
             if safe_zone_size > 0:
                 structure = np.ones(2 * safe_zone_size + 1, dtype=bool)
                 safe_zone_mask = binary_dilation(won_mask > 0, structure=structure)
             else:
                 safe_zone_mask = (won_mask > 0)
-            
             safe_only_mask = safe_zone_mask & (won_mask == 0)
+
+            # Local Evaluation logic for the grid visual - nondwelling grace zone
+            grace_zone_size = 9
+            nd_labels, num_nd = label(nd_mask > 0)
+            nd_grace_mask = np.zeros_like(nd_mask, dtype=bool)
+
+            for nd_idx in range(1, num_nd + 1):
+                nd_seg = (nd_labels == nd_idx)
+                inds = np.where(nd_seg)[0]
+
+                if len(inds) == 0:
+                    continue
+
+                start = inds[0]
+                end = inds[-1]
+                nd_grace_mask[start:min(start + grace_zone_size, len(nd_mask))] = True
+                nd_grace_mask[max(0, end - grace_zone_size + 1):end + 1] = True
+            
+            safe_zone_mask = safe_zone_mask | nd_grace_mask
 
             # 1. Safe Frames (Light blue diagonal hatch bottom 0.3)
             safe_labels, num_safe = label(safe_only_mask)
@@ -858,6 +935,16 @@ def plot_source_grid(results_path, src, out_dir, ppc, val_keys,cols=10,rows=None
                 if et[s_end] > et[s_start]:
                     ax.add_patch(plt.Rectangle((et[s_start], 0), et[s_end] - et[s_start], 0.3, 
                                                facecolor='none', edgecolor='lightblue', hatch='///', linewidth=0))
+                    
+            grace_labels, num_grace = label(nd_grace_mask)
+            frame_dt = 1/6
+            for g_idx in range(1, num_grace + 1):
+                g_mask = (grace_labels == g_idx)
+                g_start = np.where(g_mask)[0][0]
+                g_end   = np.where(g_mask)[0][-1]
+                if et[g_end] > et[g_start]:
+                    ax.add_patch(plt.Rectangle((et[g_start], 0), et[g_end] - et[g_start] + frame_dt, 0.3,
+                                                facecolor='gray', alpha=0.3, edgecolor='lightblue', hatch='\\\\\\', linewidth=0))
 
             # 2. TP & FN Logic
             gt_labels, num_gt = label(won_mask)
@@ -1017,6 +1104,7 @@ def get_event_info(preds_dir, val_dir, ppc,report_path,dwell_tags=("wonderful",)
     with open(report_path, "a") as f:
         f.write("\n".join(report_lines) + "\n")
         
+
 def evaluate_validation_permutation_importance(
     model_path,
     ctx,
